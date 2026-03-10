@@ -3,8 +3,8 @@ use {
     bitcoin::ScriptBuf,
     rustc_hash::FxHashMap as HashMap,
     std::fmt::Display,
-    titan_types_core::RuneId,
-    titan_types_core::{InscriptionId, Rune, SerializedOutPoint, SerializedTxid, TxOut},
+    arch_titan_types_core::RuneId,
+    arch_titan_types_core::{InscriptionId, Rune, SerializedOutPoint, SerializedTxid, TxOut},
 };
 
 pub struct BatchRollback {

@@ -10,8 +10,8 @@ use {
     rustc_hash::FxHashMap as HashMap,
     thiserror::Error,
     titan_types_api::{Pagination, PaginationResponse},
-    titan_types_core::RuneId,
-    titan_types_core::{
+    arch_titan_types_core::RuneId,
+    arch_titan_types_core::{
         Block, InscriptionId, MempoolEntry, Rune, SerializedOutPoint, SerializedTxid,
         SpenderReference, SpentStatus, Transaction, TransactionStatus, TxOut,
     },

@@ -1,7 +1,7 @@
 use {
     bitcoin::Txid,
     serde::{Deserialize, Serialize},
-    titan_types_core::{RuneAmount, SerializedOutPoint, SpentStatus, TransactionStatus, TxOut},
+    arch_titan_types_core::{RuneAmount, SerializedOutPoint, SpentStatus, TransactionStatus, TxOut},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

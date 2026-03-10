@@ -1,10 +1,10 @@
 use {
     serde::{Deserialize, Serialize},
-    titan_types_core::{InscriptionId, RuneId, SerializedTxid, SpacedRune},
+    arch_titan_types_core::{InscriptionId, RuneId, SerializedTxid, SpacedRune},
 };
 
 mod serde_str {
-    pub use titan_types_core::serde_str::{deserialize, serialize};
+    pub use arch_titan_types_core::serde_str::{deserialize, serialize};
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

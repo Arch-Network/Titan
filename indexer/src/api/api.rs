@@ -17,7 +17,7 @@ use {
         query, AddressData, BlockTip, Pagination, PaginationResponse, RuneResponse, Status,
         Subscription,
     },
-    titan_types_core::{
+    arch_titan_types_core::{
         Block, InscriptionId, MempoolEntry, SerializedOutPoint, SerializedTxid, Transaction,
         TransactionStatus, TxOut,
     },

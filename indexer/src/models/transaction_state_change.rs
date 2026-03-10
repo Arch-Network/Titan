@@ -7,7 +7,7 @@ use {
         fmt::Display,
         io::{Read, Result, Write},
     },
-    titan_types_core::{Rune, RuneAmount, RuneId, SerializedOutPoint, TxOut},
+    arch_titan_types_core::{Rune, RuneAmount, RuneId, SerializedOutPoint, TxOut},
 };
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]

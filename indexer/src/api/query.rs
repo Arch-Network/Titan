@@ -3,7 +3,7 @@ use {
     bitcoin::BlockHash,
     std::sync::Arc,
     titan_types_api::query,
-    titan_types_core::RuneId,
+    arch_titan_types_core::RuneId,
 };
 
 pub fn to_hash(block: &query::Block, index: &Arc<Index>) -> Result<BlockHash, IndexError> {

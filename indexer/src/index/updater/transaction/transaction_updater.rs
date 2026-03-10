@@ -7,9 +7,9 @@ use {
     bitcoin::Transaction,
     ordinals::{Artifact, Etching, Runestone},
     thiserror::Error,
-    titan_types_core::RuneId,
-    titan_types_core::{Event, SerializedOutPoint, SerializedTxid, SpenderReference, TxOut},
-    titan_types_core::{Rune, SpacedRune},
+    arch_titan_types_core::RuneId,
+    arch_titan_types_core::{Event, SerializedOutPoint, SerializedTxid, SpenderReference, TxOut},
+    arch_titan_types_core::{Rune, SpacedRune},
     tokio::sync::mpsc::error::SendError,
 };
 

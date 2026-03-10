@@ -41,8 +41,8 @@ use {
     },
     store_lock::StoreWithLock,
     thiserror::Error,
-    titan_types_core::{Block, Event, MempoolEntry, RuneId, SerializedTxid},
-    titan_types_core::{Rune, SpacedRune},
+    arch_titan_types_core::{Block, Event, MempoolEntry, RuneId, SerializedTxid},
+    arch_titan_types_core::{Rune, SpacedRune},
     tokio::sync::mpsc::{error::SendError, Sender},
     tracing::{debug, error, info, warn},
 };

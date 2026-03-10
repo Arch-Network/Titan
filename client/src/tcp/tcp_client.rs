@@ -6,7 +6,7 @@ use std::{
 use serde_json;
 use thiserror::Error;
 use titan_types_api::TcpSubscriptionRequest;
-use titan_types_core::Event;
+use arch_titan_types_core::Event;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -532,7 +532,7 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
     use std::sync::Arc;
     use std::sync::Once;
-    use titan_types_core::EventType;
+    use arch_titan_types_core::EventType;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener as TokioTcpListener;
     use tokio::select;
@@ -549,7 +549,7 @@ mod tests {
         INIT.call_once(|| {
             // Initialize a subscriber that prints all logs to stderr
             let filter =
-                EnvFilter::from_default_env().add_directive("titan_client=trace".parse().unwrap());
+                EnvFilter::from_default_env().add_directive("arch_titan_client=trace".parse().unwrap());
 
             tracing_subscriber::fmt()
                 .with_env_filter(filter)

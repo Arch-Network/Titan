@@ -3,8 +3,8 @@ use {
     bitcoin::{BlockHash, ScriptBuf, Transaction},
     rustc_hash::FxHashMap as HashMap,
     std::fmt::Display,
-    titan_types_core::RuneId,
-    titan_types_core::{
+    arch_titan_types_core::RuneId,
+    arch_titan_types_core::{
         Block, InscriptionId, MempoolEntry, SerializedOutPoint, SerializedTxid, SpenderReference,
         TxOut,
     },

@@ -22,7 +22,7 @@ use {
     http::{header, StatusCode},
     std::{io, net::ToSocketAddrs, sync::Arc},
     titan_types_api::{query, Pagination, Subscription},
-    titan_types_core::{InscriptionId, SerializedOutPoint, SerializedTxid},
+    arch_titan_types_core::{InscriptionId, SerializedOutPoint, SerializedTxid},
     tokio::task,
     tower_http::{
         compression::CompressionLayer,

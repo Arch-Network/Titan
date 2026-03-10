@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use bitcoin::{ScriptBuf, Transaction};
-use titan_types_core::{
+use arch_titan_types_core::{
     InscriptionId, Rune, RuneId, SerializedOutPoint, SerializedTxid, SpenderReference, TxOut,
 };
 

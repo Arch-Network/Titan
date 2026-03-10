@@ -45,13 +45,13 @@ Detailed Setup: Follow the [Setup Instructions](../SetupInstructions.md) for ste
 
 Run the following Cargo command in your project directory:
 ```bash
-cargo add titan-client
+cargo add arch-titan-client
 ```
 
 Or add the following line to your Cargo.toml:
 ```toml
 [dependencies]
-titan-client = "0.1.31"
+arch-titan-client = "0.1.31"
 ```
 
 ## Usage
@@ -63,8 +63,8 @@ The asynchronous client uses reqwest with async/await. Create an instance of Tit
 #### Example
 
 ```rust
-use titan_client::TitanApi; // Re-export of TitanApiAsync
-use titan_client::TitanClient;
+use arch_titan_client::TitanApi; // Re-export of TitanApiAsync
+use arch_titan_client::TitanClient;
 use tokio;
 
 #[tokio::main]
@@ -95,8 +95,8 @@ For environments that do not support async/await, use the blocking client (re-ex
 #### Example
 
 ```rust
-use titan_client::TitanApiBlocking; // Re-export of TitanApiSync
-use titan_client::TitanBlockingClient;
+use arch_titan_client::TitanApiBlocking; // Re-export of TitanApiSync
+use arch_titan_client::TitanBlockingClient;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a blocking client.
@@ -127,7 +127,7 @@ This client subscribes to real-time events (e.g. new blocks, transaction updates
 #### Example
 
 ```rust
-use titan_client::{subscribe_to_titan, TcpClientError};
+use arch_titan_client::{subscribe_to_titan, TcpClientError};
 use titan_types::{Event, TcpSubscriptionRequest, EventType};
 use tokio::{sync::watch, time::{sleep, Duration}};
 use std::error::Error;
@@ -179,7 +179,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
-use titan_client::{subscribe_to_titan_blocking, TcpClientError};
+use arch_titan_client::{subscribe_to_titan_blocking, TcpClientError};
 use titan_types::{Event, TcpSubscriptionRequest, EventType};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

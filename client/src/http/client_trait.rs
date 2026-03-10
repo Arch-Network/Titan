@@ -8,7 +8,7 @@ use titan_types_api::{
     query, AddressData, BlockTip, Pagination, PaginationResponse, RuneResponse, Status,
     Subscription,
 };
-use titan_types_core::{Block, InscriptionId, MempoolEntry, Transaction, TransactionStatus, TxOut};
+use arch_titan_types_core::{Block, InscriptionId, MempoolEntry, Transaction, TransactionStatus, TxOut};
 
 /// Trait for all **async** methods.
 #[async_trait]

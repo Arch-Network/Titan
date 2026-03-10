@@ -7,7 +7,7 @@ use {
         str::FromStr,
     },
     thiserror::Error,
-    titan_types_core::Rune,
+    arch_titan_types_core::Rune,
 };
 
 #[derive(Error, Debug, Clone, PartialEq)]

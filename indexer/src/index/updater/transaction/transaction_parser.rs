@@ -11,7 +11,7 @@ use {
     ordinals::{Artifact, Edict, Runestone},
     rustc_hash::FxHashMap as HashMap,
     thiserror::Error,
-    titan_types_core::{Height, Rune, RuneAmount, RuneId, SerializedOutPoint, SpentStatus, TxOut},
+    arch_titan_types_core::{Height, Rune, RuneAmount, RuneId, SerializedOutPoint, SpentStatus, TxOut},
 };
 
 #[derive(Debug, Error)]
@@ -196,7 +196,7 @@ impl<'client> TransactionParser<'client> {
                     let output = usize::try_from(output).unwrap();
                     assert!(output <= tx.output.len());
 
-                    // Convert ordinals::RuneId to titan_types_core::RuneId
+                    // Convert ordinals::RuneId to arch_titan_types_core::RuneId
                     let id = if id.block == 0 && id.tx == 0 {
                         // If the edict did not specify an id, use the etched id (if available)
                         let Some((id, ..)) = etched else {

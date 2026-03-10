@@ -22,7 +22,7 @@ use {
         time::Duration,
     },
     titan_types_api::{AddressData, AddressTxOut, Pagination, PaginationResponse},
-    titan_types_core::{
+    arch_titan_types_core::{
         Block, Event, InscriptionId, MempoolEntry, Rune, RuneAmount, RuneId, SerializedOutPoint,
         SerializedTxid, Transaction, TransactionStatus, TxOut,
     },

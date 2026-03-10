@@ -4,7 +4,7 @@ use {
         fmt::{self, Display},
         str::FromStr,
     },
-    titan_types_core::{RuneId, SpacedRune},
+    arch_titan_types_core::{RuneId, SpacedRune},
 };
 
 #[derive(Debug, thiserror::Error)]

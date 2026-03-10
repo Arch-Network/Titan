@@ -35,9 +35,9 @@ Detailed Setup: Follow the [Setup Instructions](../SetupInstructions.md) for ste
 Install the package via npm or yarn:
 
 ```bash
-npm install titan-client
+npm install arch-titan-client
 # or
-yarn add titan-client
+yarn add arch-titan-client
 ```
 
 ## Usage
@@ -49,7 +49,7 @@ The HTTP client uses axios to communicate with the Titan Indexer's REST API endp
 #### Example
 
 ```typescript
-import { TitanHttpClient } from 'titan-client';
+import { TitanHttpClient } from 'arch-titan-client';
 
 async function testHttpClient() {
   // Create an HTTP client instance.
@@ -121,7 +121,7 @@ The TCP client allows you to subscribe to real-time events from the Titan Indexe
 #### Example
 
 ```typescript
-import { TitanTcpClient } from 'titan-client';
+import { TitanTcpClient } from 'arch-titan-client';
 
 function testTcpSubscription() {
   const tcpClient = new TitanTcpClient('localhost', 4000, {

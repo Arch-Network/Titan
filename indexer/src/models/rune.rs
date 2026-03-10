@@ -5,7 +5,7 @@ use ordinals::Terms;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use titan_types_api::{MintResponse, RuneResponse};
-use titan_types_core::{InscriptionId, Rune, RuneId, SerializedTxid, SpacedRune};
+use arch_titan_types_core::{InscriptionId, Rune, RuneId, SerializedTxid, SpacedRune};
 
 #[derive(Debug, PartialEq, Error)]
 pub enum MintError {

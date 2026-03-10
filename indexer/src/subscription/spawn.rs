@@ -8,7 +8,7 @@ use {
         },
     },
     std::{sync::Arc, time::Duration},
-    titan_types_core::Event,
+    arch_titan_types_core::Event,
     tokio::{
         sync::{mpsc, watch},
         task,

@@ -1,5 +1,5 @@
 [package]
-name = "titan-types-core"
+name = "arch-titan-types-core"
 version.workspace = true
 edition = "2021"
 

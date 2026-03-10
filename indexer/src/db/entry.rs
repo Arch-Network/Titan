@@ -2,7 +2,7 @@ use {
     crate::models::{BlockId, Inscription, RuneEntry, TransactionStateChange, TxRuneIndexRef},
     borsh::{BorshDeserialize, BorshSerialize},
     titan_types_api::Subscription,
-    titan_types_core::{Block, MempoolEntry, RuneId, SpenderReference, TxOut},
+    arch_titan_types_core::{Block, MempoolEntry, RuneId, SpenderReference, TxOut},
 };
 
 pub trait Entry: Sized + BorshDeserialize + BorshSerialize {
