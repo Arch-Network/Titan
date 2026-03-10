@@ -541,8 +541,7 @@ impl<'client> TransactionParser<'client> {
 
             if self.mempool {
                 for rune_amount in tx_out.risky_runes {
-                    *risky_unallocated.entry(rune_amount.id).or_default() +=
-                        rune_amount.amount;
+                    *risky_unallocated.entry(rune_amount.id).or_default() += rune_amount.amount;
                 }
             }
         }

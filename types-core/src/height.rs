@@ -94,9 +94,11 @@ mod tests {
     fn period_offset() {
         assert_eq!(Height(0).period_offset(), 0);
         assert_eq!(Height(1).period_offset(), 1);
-        assert_eq!(Height(DIFFCHANGE_INTERVAL - 1).period_offset(), DIFFCHANGE_INTERVAL - 1);
+        assert_eq!(
+            Height(DIFFCHANGE_INTERVAL - 1).period_offset(),
+            DIFFCHANGE_INTERVAL - 1
+        );
         assert_eq!(Height(DIFFCHANGE_INTERVAL).period_offset(), 0);
         assert_eq!(Height(DIFFCHANGE_INTERVAL + 1).period_offset(), 1);
     }
 }
-
