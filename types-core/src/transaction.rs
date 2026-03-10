@@ -3,8 +3,15 @@ use {
     bitcoin::{constants::WITNESS_SCALE_FACTOR, BlockHash, Txid},
 };
 
+#[cfg(feature = "borsh")]
+use bitcoin::hashes::Hash;
+#[cfg(feature = "borsh")]
+use borsh::{BorshDeserialize, BorshSerialize};
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "borsh")]
+use std::io::{Read, Result, Write};
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -31,6 +38,37 @@ impl TransactionStatus {
             block_height: Some(block_height),
             block_hash: Some(block_hash),
         }
+    }
+}
+
+#[cfg(feature = "borsh")]
+impl BorshSerialize for TransactionStatus {
+    fn serialize<W: Write>(&self, writer: &mut W) -> Result<()> {
+        BorshSerialize::serialize(&self.confirmed, writer)?;
+        BorshSerialize::serialize(&self.block_height, writer)?;
+        BorshSerialize::serialize(
+            &self
+                .block_hash
+                .map(|hash| hash.as_raw_hash().to_byte_array()),
+            writer,
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "borsh")]
+impl BorshDeserialize for TransactionStatus {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> Result<Self> {
+        let confirmed = bool::deserialize_reader(reader)?;
+        let block_height = Option::<u64>::deserialize_reader(reader)?;
+        let block_hash = Option::<[u8; 32]>::deserialize_reader(reader)?;
+        let block_hash =
+            block_hash.map(|hash| BlockHash::from_raw_hash(Hash::from_slice(&hash).unwrap()));
+        Ok(Self {
+            confirmed,
+            block_height,
+            block_hash,
+        })
     }
 }
 
@@ -170,5 +208,24 @@ impl
                 .collect(),
             status,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use borsh::BorshSerialize;
+
+    #[test]
+    fn test_transaction_status_borsh_serialize() {
+        let transaction_status = TransactionStatus::confirmed(
+            100,
+            BlockHash::from_raw_hash(Hash::from_slice(&[100u8; 32]).unwrap()),
+        );
+        let mut data = Vec::new();
+        BorshSerialize::serialize(&transaction_status, &mut data).unwrap();
+        let transaction_status_deserialized =
+            TransactionStatus::deserialize_reader(&mut &data[..]).unwrap();
+        assert_eq!(transaction_status, transaction_status_deserialized);
     }
 }

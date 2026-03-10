@@ -1,6 +1,6 @@
 use {
-    bitcoin::{blockdata::constants::SUBSIDY_HALVING_INTERVAL, network::Network},
     crate::Height,
+    bitcoin::{blockdata::constants::SUBSIDY_HALVING_INTERVAL, network::Network},
     std::{
         fmt::{self, Display, Formatter},
         str::FromStr,

@@ -17,7 +17,10 @@ pub struct RuneAmount {
 
 impl From<(RuneId, u128)> for RuneAmount {
     fn from((rune_id, amount): (RuneId, u128)) -> Self {
-        Self { id: rune_id, amount }
+        Self {
+            id: rune_id,
+            amount,
+        }
     }
 }
 
