@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 arch-titan-types-core = { workspace = true, features = ["serde", "borsh", "bitcoincore-rpc"] }
-titan-types-api = { workspace = true }
+arch-titan-types-api = { workspace = true }
 
 axum = { workspace = true }
 axum-server = { workspace = true }

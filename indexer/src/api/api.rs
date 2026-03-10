@@ -13,7 +13,7 @@ use {
     http::HeaderMap,
     rustc_hash::FxHashMap as HashMap,
     std::sync::Arc,
-    titan_types_api::{
+    arch_titan_types_api::{
         query, AddressData, BlockTip, Pagination, PaginationResponse, RuneResponse, Status,
         Subscription,
     },

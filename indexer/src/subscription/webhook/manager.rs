@@ -5,7 +5,7 @@ use {
     },
     reqwest::Client,
     std::sync::Arc,
-    titan_types_api::Subscription,
+    arch_titan_types_api::Subscription,
     arch_titan_types_core::Event,
     uuid::Uuid,
 };

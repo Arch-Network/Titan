@@ -9,7 +9,7 @@ use {
     bitcoin::{consensus, hex::HexToArrayError, BlockHash, ScriptBuf},
     rustc_hash::FxHashMap as HashMap,
     thiserror::Error,
-    titan_types_api::{Pagination, PaginationResponse},
+    arch_titan_types_api::{Pagination, PaginationResponse},
     arch_titan_types_core::RuneId,
     arch_titan_types_core::{
         Block, InscriptionId, MempoolEntry, Rune, SerializedOutPoint, SerializedTxid,

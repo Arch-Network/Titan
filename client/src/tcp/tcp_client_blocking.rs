@@ -11,7 +11,7 @@ use std::{
 
 use serde_json;
 use thiserror::Error;
-use titan_types_api::TcpSubscriptionRequest;
+use arch_titan_types_api::TcpSubscriptionRequest;
 use arch_titan_types_core::Event;
 use tracing::{debug, error, info, warn};
 

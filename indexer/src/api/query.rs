@@ -2,7 +2,7 @@ use {
     crate::index::{Index, IndexError},
     bitcoin::BlockHash,
     std::sync::Arc,
-    titan_types_api::query,
+    arch_titan_types_api::query,
     arch_titan_types_core::RuneId,
 };
 

@@ -4,7 +4,7 @@ use crate::Error;
 use async_trait::async_trait;
 use bitcoin::{OutPoint, Txid};
 use reqwest::header::HeaderMap;
-use titan_types_api::{
+use arch_titan_types_api::{
     query, AddressData, BlockTip, Pagination, PaginationResponse, RuneResponse, Status,
     Subscription,
 };

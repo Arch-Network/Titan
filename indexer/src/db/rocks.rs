@@ -24,7 +24,7 @@ use {
         collections::VecDeque,
         sync::{Arc, RwLock},
     },
-    titan_types_api::{Pagination, PaginationResponse, Subscription},
+    arch_titan_types_api::{Pagination, PaginationResponse, Subscription},
     arch_titan_types_core::{
         Block, InscriptionId, MempoolEntry, RuneId, SerializedOutPoint, SerializedTxid,
         SpenderReference, TxOut,

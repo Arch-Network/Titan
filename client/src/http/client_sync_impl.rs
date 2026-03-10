@@ -1,7 +1,7 @@
 use bitcoin::{OutPoint, Txid};
 use reqwest::{blocking::Client as BlockingReqwestClient, header::HeaderMap};
 use std::{collections::HashMap, str::FromStr};
-use titan_types_api::*;
+use arch_titan_types_api::*;
 use arch_titan_types_core::*;
 
 use crate::Error;

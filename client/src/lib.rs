@@ -10,7 +10,7 @@ pub use http::{
 };
 pub use tcp::{ConnectionStatus, ConnectionStatusTracker};
 pub use tcp::{ReconnectionConfig, ReconnectionManager};
-pub use titan_types_api::*;
+pub use arch_titan_types_api::*;
 pub use arch_titan_types_core::*;
 
 #[cfg(feature = "tcp_client")]
@@ -23,7 +23,7 @@ pub use tcp::{TitanTcpClientBlocking, TitanTcpClientBlockingConfig, TitanTcpClie
 mod tests {
     use super::*;
     use std::error::Error;
-    use titan_types_api::TcpSubscriptionRequest;
+    use arch_titan_types_api::TcpSubscriptionRequest;
     use tokio::time::{Duration, Instant};
 
     // Import the HTTP and TCP client functions.

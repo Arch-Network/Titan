@@ -21,7 +21,7 @@ use {
         thread::{self},
         time::Duration,
     },
-    titan_types_api::{AddressData, AddressTxOut, Pagination, PaginationResponse},
+    arch_titan_types_api::{AddressData, AddressTxOut, Pagination, PaginationResponse},
     arch_titan_types_core::{
         Block, Event, InscriptionId, MempoolEntry, Rune, RuneAmount, RuneId, SerializedOutPoint,
         SerializedTxid, Transaction, TransactionStatus, TxOut,
