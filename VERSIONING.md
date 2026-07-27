@@ -46,12 +46,12 @@ When you create a version tag `v1.2.3`, the CI/CD creates:
 
 | Tag | Description | Example |
 |-----|-------------|---------|
-| `v1.2.3` | Exact version | `ghcr.io/saturnbtc/titan:v1.2.3` |
-| `1.2` | Major.Minor | `ghcr.io/saturnbtc/titan:1.2` |
-| `1` | Major only | `ghcr.io/saturnbtc/titan:1` |
-| `latest` | Latest stable | `ghcr.io/saturnbtc/titan:latest` |
-| `main` | Latest main branch | `ghcr.io/saturnbtc/titan:main` |
-| `sha-abc123` | Specific commit | `ghcr.io/saturnbtc/titan:sha-abc123` |
+| `v1.2.3` | Exact version | `ghcr.io/arch-network/titan:v1.2.3` |
+| `1.2` | Major.Minor | `ghcr.io/arch-network/titan:1.2` |
+| `1` | Major only | `ghcr.io/arch-network/titan:1` |
+| `latest` | Latest stable | `ghcr.io/arch-network/titan:latest` |
+| `main` | Latest main branch | `ghcr.io/arch-network/titan:main` |
+| `sha-abc123` | Specific commit | `ghcr.io/arch-network/titan:sha-abc123` |
 
 ## 🔧 Using Versions in Docker Compose
 
@@ -84,7 +84,7 @@ git tag -l
 git ls-remote --tags origin
 
 # List Docker image tags (requires GitHub CLI)
-gh api repos/saturnbtc/titan/packages/container/titan/versions
+gh api repos/Arch-Network/Titan/packages/container/titan/versions
 ```
 
 ### Delete Tags
@@ -120,8 +120,8 @@ docker-compose up -d
 ### Emergency Rollback
 ```bash
 # Pull specific version immediately
-docker pull ghcr.io/saturnbtc/titan:v0.9.0
-docker tag ghcr.io/saturnbtc/titan:v0.9.0 ghcr.io/saturnbtc/titan:latest
+docker pull ghcr.io/arch-network/titan:v0.9.0
+docker tag ghcr.io/arch-network/titan:v0.9.0 ghcr.io/arch-network/titan:latest
 
 # Restart with local tag
 docker-compose restart titan

@@ -1,6 +1,6 @@
 # Titan Client for Rust
 
-**Titan Client** is a Rust library that provides both HTTP and TCP clients for interacting with the [Titan Indexer](https://github.com/SaturnBTC/titan) for Bitcoin and runes. The indexer itself is written in Rust and indexes Bitcoin blockchain data along with runic metadata. This client package allows you to:
+**Titan Client** is a Rust library that provides both HTTP and TCP clients for interacting with the [Titan Indexer](https://github.com/Arch-Network/Titan) for Bitcoin and runes. The indexer itself is written in Rust and indexes Bitcoin blockchain data along with runic metadata. This client package allows you to:
 
 - **Query data** such as node status, block tips, transactions, addresses, inscriptions, and runes using HTTP.
 - **Broadcast transactions** to the Bitcoin network.

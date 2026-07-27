@@ -259,13 +259,13 @@ bitcoin-27.0/bin/bitcoin-cli listwallets
     }
 
 
-# Setting up Saturn Titan Indexer
+# Setting up Titan Indexer
 
-### Git clone Saturn Titan Indexer
+### Clone Titan Indexer
 
 ***Command:***
 ```bash
-git clone https://github.com/SaturnBTC/Titan.git 
+git clone https://github.com/Arch-Network/Titan.git
 ```
 ### Create data dir (optional)
 

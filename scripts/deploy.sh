@@ -73,7 +73,7 @@ update_env_file() {
 # Function to check if image exists
 check_image_exists() {
     local version=$1
-    local image="ghcr.io/saturnbtc/titan:$version"
+    local image="ghcr.io/arch-network/titan:$version"
     
     echo -e "${BLUE}Checking if image exists: $image${NC}"
     
@@ -100,7 +100,7 @@ deploy() {
     echo -e "${BLUE}Deployment Plan:${NC}"
     echo "Version: $version"
     echo "Compose file: $compose_file"
-    echo "Image: ghcr.io/saturnbtc/titan:$version"
+    echo "Image: ghcr.io/arch-network/titan:$version"
     echo ""
     
     if [ "$dry_run" = true ]; then

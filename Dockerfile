@@ -1,5 +1,5 @@
 # Stage 1: Builder – compile Titan
-FROM rust:1.81.0-bookworm AS builder
+FROM rust:1.94.0-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -11,13 +11,14 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /tmp
 COPY . .
-RUN cargo build --release
+RUN cargo build --locked --release --package titan
 
 # Stage 2: Runner – minimal runtime
 FROM debian:bookworm-slim AS runner
 
 # Install runtime deps
 RUN apt-get update && apt-get install -y \
+    curl \
     libssl3 \
     librocksdb7.8 \
     ca-certificates \
@@ -43,11 +44,13 @@ WORKDIR /home/titan
 ENV COMMIT_INTERVAL=5
 ENV BITCOIN_RPC_URL=127.0.0.1:18443
 ENV BITCOIN_RPC_USERNAME=bitcoin
-ENV BITCOIN_RPC_PASSWORD=bitcoinpass
 ENV CHAIN=regtest
 ENV HTTP_LISTEN=0.0.0.0:3030
 ENV TCP_ADDRESS=0.0.0.0:8080
 ENV MAIN_LOOP_INTERVAL=500
+
+# Arch Network deployments configure the HTTP and TCP listener assignments at runtime.
+EXPOSE 3030 8080
 
 # Expose the mountpoint for the data dir
 VOLUME ["/home/titan/data"]
