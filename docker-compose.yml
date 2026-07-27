@@ -1,6 +1,6 @@
 services:
   titan:
-    image: ghcr.io/${GITHUB_REPOSITORY:-saturnbtc/titan}:${DOCKER_TAG:-latest}
+    image: ghcr.io/${GITHUB_REPOSITORY:-arch-network/titan}:${DOCKER_TAG:-latest}
     restart: always
     depends_on:
       bitcoind:

@@ -105,8 +105,8 @@ main() {
             echo -e "${GREEN}✓ Tag pushed successfully${NC}"
             echo ""
             echo -e "${GREEN}🚀 Version $new_version has been released!${NC}"
-            echo "Monitor the build at: https://github.com/saturnBTC/titan/actions"
-            echo "Image will be available at: ghcr.io/saturnbtc/titan:$new_version"
+            echo "Monitor the build at: https://github.com/Arch-Network/Titan/actions"
+            echo "Image will be available at: ghcr.io/arch-network/titan:$new_version"
         else
             echo -e "${RED}✗ Failed to push tag${NC}"
             exit 1

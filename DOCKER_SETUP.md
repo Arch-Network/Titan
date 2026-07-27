@@ -11,9 +11,9 @@ This project is configured to automatically build and publish Docker images to G
    cp .env.example .env
    ```
 
-2. Edit `.env` and update the `GITHUB_REPOSITORY` value (defaults to saturnbtc/titan):
+2. Edit `.env` and update the `GITHUB_REPOSITORY` value (defaults to arch-network/titan):
    ```bash
-   GITHUB_REPOSITORY=saturnbtc/titan
+   GITHUB_REPOSITORY=arch-network/titan
    ```
 
 3. Run with Docker Compose:
@@ -56,7 +56,7 @@ The workflow creates multiple tags:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GITHUB_REPOSITORY` | `saturnbtc/titan` | Your GitHub repository name |
+| `GITHUB_REPOSITORY` | `arch-network/titan` | Your GitHub repository name |
 | `DOCKER_TAG` | `latest` | Docker image tag to use |
 | `BITCOIN_NETWORK` | `regtest` | Bitcoin network (regtest/testnet/mainnet) |
 | `BITCOIN_RPC_PORT` | `18443` | Bitcoin RPC port |
@@ -79,10 +79,10 @@ To build and push manually:
 
 ```bash
 # Build locally
-docker build -t ghcr.io/saturnbtc/titan:latest .
+docker build -t ghcr.io/arch-network/titan:latest .
 
 # Push to registry (requires authentication)
-docker push ghcr.io/saturnbtc/titan:latest
+docker push ghcr.io/arch-network/titan:latest
 ```
 
 ## Troubleshooting
