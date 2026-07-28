@@ -85,8 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = Server;
     let http_server_jh = server.start(
         index.clone(),
-        webhook_subscription_manager
-            .unwrap_or(Arc::new(WebhookSubscriptionManager::new(db_arc.clone()))),
+        webhook_subscription_manager.unwrap_or_else(|| {
+            Arc::new(WebhookSubscriptionManager::new(db_arc.clone()))
+        }),
         bitcoin_rpc_pool.clone(),
         Arc::new(server_config),
         handle.clone(),

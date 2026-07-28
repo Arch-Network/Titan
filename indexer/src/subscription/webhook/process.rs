@@ -258,6 +258,14 @@ fn is_public_ipv6(address: Ipv6Addr) -> bool {
         && !(segments[0] == 0x3fff && segments[1] < 0x1000)
 }
 
+fn is_retryable_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
 async fn send_event_with_retry(endpoint: &str, event: &Event) -> Result<(), SendEventError> {
     let resolved_endpoint = resolve_webhook_endpoint(endpoint).await?;
     let client = resolved_endpoint.client()?;
@@ -279,7 +287,7 @@ async fn send_event_with_retry(endpoint: &str, event: &Event) -> Result<(), Send
                 let status = response.status();
                 last_error = format!("HTTP status {status}");
 
-                if status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS {
+                if !is_retryable_status(status) {
                     return Err(SendEventError::Failed {
                         attempts: attempt,
                         last_error,
@@ -307,7 +315,7 @@ pub async fn process_event(
     store: &Arc<dyn Store>,
     delivery_semaphore: &Arc<Semaphore>,
     event: &Event,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let event_type = EventType::from(event.clone());
     let subscriptions = store.get_subscriptions()?;
 
@@ -354,6 +362,31 @@ mod tests {
         let trailing_dot = parse_webhook_url("https://example.com./webhook").unwrap();
         assert_eq!(trailing_dot.host, "example.com.");
         assert_eq!(trailing_dot.normalized_host, "example.com");
+    }
+
+    #[test]
+    fn retries_only_transient_http_statuses() {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_EARLY,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(is_retryable_status(status), "{status} should be retried");
+        }
+
+        for status in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert!(
+                !is_retryable_status(status),
+                "{status} should not be retried"
+            );
+        }
     }
 
     #[test]

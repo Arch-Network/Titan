@@ -8,12 +8,17 @@ use {
     arch_titan_types_core::Event,
     std::sync::{Arc, Mutex},
     thiserror::Error,
-    tokio::sync::Semaphore,
+    tokio::sync::{
+        mpsc::{self, error::TrySendError},
+        Semaphore,
+    },
+    tracing::error,
     uuid::Uuid,
 };
 
 const MAX_CONCURRENT_WEBHOOK_DELIVERIES: usize = 32;
 const MAX_WEBHOOK_SUBSCRIPTIONS: usize = 100;
+const MAX_QUEUED_WEBHOOK_EVENTS: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum ManagerError {
@@ -25,20 +30,38 @@ pub enum ManagerError {
     LimitExceeded { limit: usize },
     #[error("webhook subscription mutation lock is poisoned")]
     MutationLockPoisoned,
+    #[error("webhook delivery queue is full ({capacity} events)")]
+    DeliveryQueueFull { capacity: usize },
+    #[error("webhook delivery queue is closed")]
+    DeliveryQueueClosed,
 }
 
 pub struct SubscriptionManager {
     store: Arc<dyn Store>,
     mutation_lock: Mutex<()>,
-    delivery_semaphore: Arc<Semaphore>,
+    delivery_sender: mpsc::Sender<Event>,
 }
 
 impl SubscriptionManager {
     pub fn new(store: Arc<dyn Store>) -> Self {
+        let (delivery_sender, mut delivery_receiver) = mpsc::channel(MAX_QUEUED_WEBHOOK_EVENTS);
+        let delivery_store = store.clone();
+        let delivery_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_WEBHOOK_DELIVERIES));
+
+        tokio::spawn(async move {
+            while let Some(event) = delivery_receiver.recv().await {
+                if let Err(error) =
+                    process_event(&delivery_store, &delivery_semaphore, &event).await
+                {
+                    error!("Error processing queued webhook event: {error}");
+                }
+            }
+        });
+
         Self {
             store,
             mutation_lock: Mutex::new(()),
-            delivery_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_WEBHOOK_DELIVERIES)),
+            delivery_sender,
         }
     }
 
@@ -80,8 +103,15 @@ impl SubscriptionManager {
         Ok(self.store.get_subscription(id)?)
     }
 
-    pub async fn broadcast(&self, event: &Event) -> Result<(), Box<dyn std::error::Error>> {
-        process_event(&self.store, &self.delivery_semaphore, event).await
+    pub fn broadcast(&self, event: &Event) -> Result<(), ManagerError> {
+        self.delivery_sender
+            .try_send(event.clone())
+            .map_err(|error| match error {
+                TrySendError::Full(_) => ManagerError::DeliveryQueueFull {
+                    capacity: self.delivery_sender.max_capacity(),
+                },
+                TrySendError::Closed(_) => ManagerError::DeliveryQueueClosed,
+            })
     }
 }
 
@@ -157,9 +187,18 @@ mod tests {
         }
     }
 
+    fn manager(store: Arc<dyn Store>) -> SubscriptionManager {
+        let (delivery_sender, _delivery_receiver) = mpsc::channel(1);
+        SubscriptionManager {
+            store,
+            mutation_lock: Mutex::new(()),
+            delivery_sender,
+        }
+    }
+
     #[test]
     fn enforces_subscription_limit_without_blocking_updates() {
-        let manager = SubscriptionManager::new(Arc::new(MemoryStore::default()));
+        let manager = manager(Arc::new(MemoryStore::default()));
 
         for id in 1..=MAX_WEBHOOK_SUBSCRIPTIONS as u128 {
             manager.add_subscription(&subscription(id)).unwrap();
@@ -186,7 +225,7 @@ mod tests {
 
     #[test]
     fn rejects_private_endpoint_before_storage() {
-        let manager = SubscriptionManager::new(Arc::new(MemoryStore::default()));
+        let manager = manager(Arc::new(MemoryStore::default()));
         let mut subscription = subscription(1);
         subscription.endpoint = "http://169.254.169.254/latest/meta-data".to_string();
 
@@ -197,5 +236,30 @@ mod tests {
             )))
         ));
         assert!(manager.get_subscriptions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn webhook_queue_is_bounded_and_non_blocking() {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::default());
+        let (delivery_sender, mut delivery_receiver) = mpsc::channel(1);
+        let manager = SubscriptionManager {
+            store,
+            mutation_lock: Mutex::new(()),
+            delivery_sender,
+        };
+        let event = Event::TransactionsAdded { txids: Vec::new() };
+
+        manager.broadcast(&event).unwrap();
+        assert!(matches!(
+            manager.broadcast(&event),
+            Err(ManagerError::DeliveryQueueFull { capacity: 1 })
+        ));
+        assert_eq!(delivery_receiver.try_recv().unwrap(), event);
+
+        drop(delivery_receiver);
+        assert!(matches!(
+            manager.broadcast(&event),
+            Err(ManagerError::DeliveryQueueClosed)
+        ));
     }
 }

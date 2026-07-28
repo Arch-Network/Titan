@@ -28,7 +28,7 @@ pub async fn event_dispatcher(
                     Some(event) => {
                         // Process the event, e.g. dispatch to subscribed endpoints
                         if let Some(manager) = &subscription_manager {
-                            if let Err(e) = manager.broadcast(&event).await {
+                            if let Err(e) = manager.broadcast(&event) {
                                 error!("Error processing event: {:?}", e);
                             }
                         }
