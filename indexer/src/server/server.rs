@@ -8,8 +8,10 @@ use {
         api::{self, content::AcceptEncoding},
         bitcoin_rpc::RpcClientPool,
         index::Index,
-        subscription::WebhookSubscriptionManager,
+        subscription::{validate_webhook_endpoint, WebhookSubscriptionManager},
     },
+    arch_titan_types_api::{query, Pagination, Subscription},
+    arch_titan_types_core::{InscriptionId, SerializedOutPoint, SerializedTxid},
     axum::{
         body::Bytes,
         extract::{DefaultBodyLimit, Extension, FromRef, Json, Path, Query},
@@ -19,10 +21,8 @@ use {
     },
     axum_server::Handle,
     bitcoin::{address::NetworkUnchecked, Address, BlockHash},
-    http::{header, StatusCode},
+    http::{header, Method, StatusCode},
     std::{io, net::ToSocketAddrs, sync::Arc},
-    arch_titan_types_api::{query, Pagination, Subscription},
-    arch_titan_types_core::{InscriptionId, SerializedOutPoint, SerializedTxid},
     tokio::task,
     tower_http::{
         compression::CompressionLayer,
@@ -43,6 +43,8 @@ pub enum SpawnError {
 }
 
 type SpawnResult<T> = std::result::Result<T, SpawnError>;
+
+const MAX_HTTP_BODY_SIZE: usize = 2 * 1024 * 1024;
 
 pub struct Server;
 
@@ -104,10 +106,11 @@ impl Server {
             .layer(Extension(bitcoin_rpc_pool))
             .layer(
                 CorsLayer::new()
-                    .allow_methods([http::Method::GET])
+                    .allow_methods([Method::GET, Method::POST, Method::DELETE])
+                    .allow_headers([header::CONTENT_TYPE])
                     .allow_origin(Any),
             )
-            .layer(DefaultBodyLimit::disable())
+            .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_SIZE))
             .layer(CompressionLayer::new())
             .with_state(config.clone());
 
@@ -385,6 +388,10 @@ impl Server {
                 "subscriptions are not enabled".to_string(),
             ));
         }
+
+        validate_webhook_endpoint(&subscription.endpoint)
+            .await
+            .map_err(|error| ServerError::BadRequest(error.to_string()))?;
 
         task::block_in_place(|| {
             Ok(Json(api::add_subscription(subscription_manager, subscription)?).into_response())

@@ -46,20 +46,22 @@ This guide explains how to build and run the Titan indexer together with a Bitco
 
 - **Docker & Docker Compose:** Make sure you have Docker and Docker Compose installed.
 - **Git:** Required to build the Titan image from source.
-- **.env Configuration:** Before starting, copy the provided example environment file and update the necessary values.
+- **.env Configuration:** Copy `.env.example` to `.env`, then set a unique `BITCOIN_RPC_USERNAME` and a long, random `BITCOIN_RPC_PASSWORD`. Docker Compose rejects empty credentials.
 
 ## How to run
 
-The docker-compose file orchestrates two services on a custom network (titan-network):
+The Docker Compose file orchestrates two services on a private `titan-network`:
 
 - bitcoind:
-  Runs the official Bitcoin Core container in regtest mode with -txindex enabled and RPC authentication via rpcauth.
+  Runs the official Bitcoin Core container in regtest mode with `-txindex` enabled. Its RPC interface requires the credentials from `.env` and is not published on the host.
 
 - titan:
-  Builds the Titan image from the local Dockerfile. It depends on Bitcoind (using a health check) and passes its configuration via environment variables.
+  Runs the configured Titan image, waits for Bitcoind to become healthy, and receives the same RPC credentials through environment variables.
 
-Run the following command in order to run services:
+Copy and configure the environment file before starting the services:
 
 ```bash
-docker-compose up --build
+cp .env.example .env
+# Set BITCOIN_RPC_USERNAME and BITCOIN_RPC_PASSWORD in .env.
+docker compose up
 ```

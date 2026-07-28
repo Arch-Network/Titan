@@ -3,6 +3,7 @@ use {
         api::{content::ContentError, ApiError},
         bitcoin_rpc::{RpcClientError, RpcClientPoolError},
         index::{IndexError, StoreError},
+        subscription::WebhookManagerError,
     },
     axum::response::{IntoResponse, Response},
     http::{header, HeaderValue, StatusCode},
@@ -37,6 +38,19 @@ impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         match self {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+            Self::ApiError(ApiError::IndexNotReady) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "index is not ready").into_response()
+            }
+            Self::ApiError(ApiError::SubscriptionError(WebhookManagerError::InvalidEndpoint(
+                error,
+            ))) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+            Self::ApiError(ApiError::SubscriptionError(WebhookManagerError::LimitExceeded {
+                limit,
+            })) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("webhook subscription limit reached ({limit})"),
+            )
+                .into_response(),
             Self::ApiError(ApiError::IndexError(IndexError::StoreError(StoreError::NotFound(
                 message,
             )))) => (StatusCode::NOT_FOUND, message).into_response(),
@@ -121,5 +135,16 @@ impl<T> OptionExt<T> for Option<T> {
             Some(value) => Ok(value),
             None => Err(ServerError::NotFound(f().into() + " not found")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_not_ready_is_service_unavailable() {
+        let response = ServerError::ApiError(ApiError::IndexNotReady).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

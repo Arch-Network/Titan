@@ -11,14 +11,17 @@ This project is configured to automatically build and publish Docker images to G
    cp .env.example .env
    ```
 
-2. Edit `.env` and update the `GITHUB_REPOSITORY` value (defaults to arch-network/titan):
-   ```bash
+2. Edit `.env`, select the image repository, and set unique Bitcoin RPC credentials:
+   ```dotenv
    GITHUB_REPOSITORY=arch-network/titan
+   BITCOIN_RPC_USERNAME=<unique-random-username>
+   BITCOIN_RPC_PASSWORD=<long-random-password>
    ```
+   Docker Compose refuses to start when either credential is empty.
 
 3. Run with Docker Compose:
    ```bash
-   docker-compose up -d
+   docker compose up -d
    ```
 
 ### Local Development
@@ -26,7 +29,7 @@ This project is configured to automatically build and publish Docker images to G
 For local development with live rebuilding:
 
 ```bash
-docker-compose -f docker-compose.dev.yml up -d
+docker compose -f docker-compose.dev.yml up -d
 ```
 
 ## GitHub Actions Setup
@@ -59,12 +62,14 @@ The workflow creates multiple tags:
 | `GITHUB_REPOSITORY` | `arch-network/titan` | Your GitHub repository name |
 | `DOCKER_TAG` | `latest` | Docker image tag to use |
 | `BITCOIN_NETWORK` | `regtest` | Bitcoin network (regtest/testnet/mainnet) |
-| `BITCOIN_RPC_PORT` | `18443` | Bitcoin RPC port |
-| `BITCOIN_RPC_USERNAME` | `bitcoin` | Bitcoin RPC username |
-| `BITCOIN_RPC_PASSWORD` | `bitcoinpass` | Bitcoin RPC password |
+| `BITCOIN_RPC_PORT` | `18443` | Bitcoin RPC port inside the Compose network |
+| `BITCOIN_RPC_USERNAME` | Required | Unique Bitcoin RPC username |
+| `BITCOIN_RPC_PASSWORD` | Required | Long, random Bitcoin RPC password |
 | `TITAN_HTTP_PORT` | `3030` | Titan HTTP API port |
 | `TITAN_TCP_PORT` | `8080` | Titan TCP subscription port |
 | `COMMIT_INTERVAL` | `5` | Titan commit interval |
+
+Bitcoin RPC is available only to containers on `titan-network`; Compose does not publish it on the host. Use `docker compose exec bitcoind` with the credentials from `.env` for administrative RPC calls.
 
 ## Workflow Triggers
 

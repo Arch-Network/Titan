@@ -5,5 +5,6 @@ mod webhook;
 
 pub use spawn::*;
 pub use webhook::{
-    StoreError as WebhookStoreError, SubscriptionManager as WebhookSubscriptionManager,
+    validate_webhook_endpoint, ManagerError as WebhookManagerError,
+    SubscriptionManager as WebhookSubscriptionManager,
 };

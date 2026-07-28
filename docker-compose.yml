@@ -14,8 +14,8 @@ services:
     environment:
       - COMMIT_INTERVAL=${COMMIT_INTERVAL:-5}
       - BITCOIN_RPC_URL=http://bitcoind:${BITCOIN_RPC_PORT:-18443}
-      - BITCOIN_RPC_USERNAME=${BITCOIN_RPC_USERNAME:-bitcoin}
-      - BITCOIN_RPC_PASSWORD=${BITCOIN_RPC_PASSWORD:-bitcoinpass}
+      - BITCOIN_RPC_USERNAME=${BITCOIN_RPC_USERNAME:?BITCOIN_RPC_USERNAME is required}
+      - BITCOIN_RPC_PASSWORD=${BITCOIN_RPC_PASSWORD:?BITCOIN_RPC_PASSWORD is required}
       - CHAIN=${BITCOIN_NETWORK:-regtest}
       - HTTP_LISTEN=0.0.0.0:${TITAN_HTTP_PORT:-3030}
       - TCP_ADDRESS=0.0.0.0:${TITAN_TCP_PORT:-8080}
@@ -24,8 +24,6 @@ services:
 
   bitcoind:
     image: bitcoin/bitcoin
-    ports:
-      - 0.0.0.0:${BITCOIN_RPC_PORT:-18443}:${BITCOIN_RPC_PORT:-18443}
     volumes:
       - "btcd-data:/var/lib/bitcoin-core"
     networks:
@@ -33,11 +31,11 @@ services:
         ipv4_address: 172.28.0.3
     command: |
       -${BITCOIN_NETWORK:-regtest}
-      -rpcallowip=0.0.0.0/0
+      -rpcallowip=172.28.0.0/24
       -datadir=/var/lib/bitcoin-core
       -rpcbind=bitcoind
-      -rpcuser=${BITCOIN_RPC_USERNAME:-bitcoin}
-      -rpcpassword=${BITCOIN_RPC_PASSWORD:-bitcoinpass}
+      -rpcuser=${BITCOIN_RPC_USERNAME:?BITCOIN_RPC_USERNAME is required}
+      -rpcpassword=${BITCOIN_RPC_PASSWORD:?BITCOIN_RPC_PASSWORD is required}
       -fallbackfee=0.00000001
       -txindex
     healthcheck:
@@ -48,8 +46,8 @@ services:
           "-${BITCOIN_NETWORK:-regtest}",
           "-rpcconnect=bitcoind",
           "-rpcport=${BITCOIN_RPC_PORT:-18443}",
-          "-rpcuser=${BITCOIN_RPC_USERNAME:-bitcoin}",
-          "-rpcpassword=${BITCOIN_RPC_PASSWORD:-bitcoinpass}",
+          "-rpcuser=${BITCOIN_RPC_USERNAME:?BITCOIN_RPC_USERNAME is required}",
+          "-rpcpassword=${BITCOIN_RPC_PASSWORD:?BITCOIN_RPC_PASSWORD is required}",
           "getblockchaininfo",
         ]
       interval: 10s

@@ -1,8 +1,9 @@
-use bitcoin::{OutPoint, Txid};
-use reqwest::{header::HeaderMap, Client as AsyncReqwestClient};
-use std::{collections::HashMap, str::FromStr};
 use arch_titan_types_api::*;
 use arch_titan_types_core::*;
+use bitcoin::{OutPoint, Txid};
+use reqwest::{header::HeaderMap, Client as AsyncReqwestClient};
+use serde::Serialize;
+use std::{collections::HashMap, str::FromStr};
 
 use crate::Error;
 
@@ -48,6 +49,19 @@ impl AsyncClient {
     async fn post_text(&self, path: &str, body: String) -> Result<String, Error> {
         let url = format!("{}{}", self.base_url, path);
         let response = self.http_client.post(&url).body(body).send().await?;
+        if response.status().is_success() {
+            Ok(response.text().await?)
+        } else {
+            Err(Error::TitanError(response.status(), response.text().await?))
+        }
+    }
+
+    async fn post_json<T>(&self, path: &str, body: &T) -> Result<String, Error>
+    where
+        T: Serialize + ?Sized,
+    {
+        let url = format!("{}{}", self.base_url, path);
+        let response = self.http_client.post(&url).json(body).send().await?;
         if response.status().is_success() {
             Ok(response.text().await?)
         } else {
@@ -185,9 +199,7 @@ impl TitanApiAsync for AsyncClient {
         &self,
         txids: &[Txid],
     ) -> Result<HashMap<Txid, Option<MempoolEntry>>, Error> {
-        let text = self
-            .post_text("/mempool/entries", serde_json::to_string(txids)?)
-            .await?;
+        let text = self.post_json("/mempool/entries", txids).await?;
         serde_json::from_str(&text).map_err(Error::from)
     }
 
@@ -222,13 +234,31 @@ impl TitanApiAsync for AsyncClient {
     }
 
     async fn add_subscription(&self, subscription: &Subscription) -> Result<Subscription, Error> {
-        let text = self
-            .post_text("/subscription", serde_json::to_string(subscription)?)
-            .await?;
+        let text = self.post_json("/subscription", subscription).await?;
         serde_json::from_str(&text).map_err(Error::from)
     }
 
     async fn delete_subscription(&self, id: &str) -> Result<(), Error> {
         self.delete(&format!("/subscription/{}", id)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, crate::http::test_utils::serve_once};
+
+    #[tokio::test]
+    async fn posts_json_with_content_type() {
+        let (base_url, request) = serve_once("{}");
+        let client = AsyncClient::new(&base_url);
+
+        assert!(client.get_mempool_entries(&[]).await.unwrap().is_empty());
+
+        let request = request.join().unwrap();
+        assert!(request.starts_with("POST /mempool/entries HTTP/1.1\r\n"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("\r\ncontent-type: application/json\r\n"));
+        assert!(request.ends_with("\r\n\r\n[]"));
     }
 }

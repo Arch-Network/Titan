@@ -8,11 +8,6 @@ use {
         index::{Index, IndexError},
         subscription::{self, WebhookSubscriptionManager},
     },
-    bitcoin::{consensus, Address, BlockHash},
-    bitcoincore_rpc::RpcApi,
-    http::HeaderMap,
-    rustc_hash::FxHashMap as HashMap,
-    std::sync::Arc,
     arch_titan_types_api::{
         query, AddressData, BlockTip, Pagination, PaginationResponse, RuneResponse, Status,
         Subscription,
@@ -21,6 +16,11 @@ use {
         Block, InscriptionId, MempoolEntry, SerializedOutPoint, SerializedTxid, Transaction,
         TransactionStatus, TxOut,
     },
+    bitcoin::{consensus, Address, BlockHash},
+    bitcoincore_rpc::RpcApi,
+    http::HeaderMap,
+    rustc_hash::FxHashMap as HashMap,
+    std::sync::Arc,
     tracing::error,
     uuid::Uuid,
 };
@@ -34,18 +34,23 @@ pub enum ApiError {
     #[error("content error: {0}")]
     ContentError(#[from] ContentError),
     #[error("subscription error: {0}")]
-    SubscriptionError(#[from] subscription::WebhookStoreError),
+    SubscriptionError(#[from] subscription::WebhookManagerError),
     #[error("hex error: {0}")]
     HexError(#[from] hex::FromHexError),
     #[error("consensus error: {0}")]
     ConsensusError(#[from] consensus::encode::Error),
+    #[error("index is not ready")]
+    IndexNotReady,
 }
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
-pub fn tip(index: Arc<Index>) -> Result<BlockTip> {
-    let block_count = index.get_block_count()?;
-    let height = block_count.saturating_sub(1);
+fn tip_height(block_count: u64) -> Result<u64> {
+    block_count.checked_sub(1).ok_or(ApiError::IndexNotReady)
+}
+
+fn block_tip(index: &Index) -> Result<BlockTip> {
+    let height = tip_height(index.get_block_count()?)?;
     let block_hash = index.get_block_hash(height)?;
     Ok(BlockTip {
         height,
@@ -54,15 +59,13 @@ pub fn tip(index: Arc<Index>) -> Result<BlockTip> {
     })
 }
 
+pub fn tip(index: Arc<Index>) -> Result<BlockTip> {
+    block_tip(&index)
+}
+
 pub fn status(index: Arc<Index>) -> Result<Status> {
-    let block_count = index.get_block_count()?;
-    let block_hash = index.get_block_hash(block_count - 1)?;
     Ok(Status {
-        block_tip: BlockTip {
-            height: block_count - 1,
-            hash: block_hash.to_string(),
-            is_at_tip: index.get_is_at_tip()?,
-        },
+        block_tip: block_tip(&index)?,
         runes_count: index.get_runes_count()?,
         mempool_tx_count: index.get_mempool_txids()?.len() as u64,
     })
@@ -276,8 +279,9 @@ pub fn subscriptions(
 pub fn add_subscription(
     subscription_manager: Arc<WebhookSubscriptionManager>,
     subscription: Subscription,
-) -> Result<()> {
-    Ok(subscription_manager.add_subscription(&subscription)?)
+) -> Result<Subscription> {
+    subscription_manager.add_subscription(&subscription)?;
+    Ok(subscription)
 }
 
 pub fn delete_subscription(
@@ -292,4 +296,16 @@ pub fn get_subscription(
     id: Uuid,
 ) -> Result<Subscription> {
     Ok(subscription_manager.get_subscription(&id)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_index_has_no_tip_height() {
+        assert!(matches!(tip_height(0), Err(ApiError::IndexNotReady)));
+        assert_eq!(tip_height(1).unwrap(), 0);
+        assert_eq!(tip_height(42).unwrap(), 41);
+    }
 }
