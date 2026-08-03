@@ -12,7 +12,7 @@ categories = []
 keywords = ["bitcoin", "indexer", "runes", "rust"]
 
 [dependencies]
-bitcoin = { version = "=0.32.5" }
+bitcoin = { version = "=0.32.7" }
 bitcoin-io = { version = "=0.1.2" }
 bytemuck = { version = "1", features = ["derive"] }
 ordinals = { workspace = true, optional = true }
