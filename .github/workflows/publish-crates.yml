@@ -1,0 +1,111 @@
+name: Publish Rust crates
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: crates-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish Titan crates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+      RELEASE_VERSION: ${{ github.ref_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Validate release tag and package versions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a stable release tag in vMAJOR.MINOR.PATCH format, got: $RELEASE_VERSION" >&2
+            exit 1
+          fi
+
+          version="${RELEASE_VERSION#v}"
+          packages=(
+            arch-titan-types-core
+            arch-titan-types-api
+            arch-titan-client
+          )
+
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          for package in "${packages[@]}"; do
+            package_version="$(jq -er --arg package "$package" '.packages[] | select(.name == $package) | .version' <<<"$metadata")"
+            if [[ "$package_version" != "$version" ]]; then
+              echo "$package version $package_version does not match tag $RELEASE_VERSION" >&2
+              exit 1
+            fi
+          done
+
+      - name: Verify crates.io token
+        shell: bash
+        run: |
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "The CRATES_IO_TOKEN secret is not available to this repository." >&2
+            exit 1
+          fi
+
+      - name: Publish crates in dependency order
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${RELEASE_VERSION#v}"
+
+          crate_exists() {
+            local crate="$1"
+            local index_url="https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}"
+
+            curl --fail --silent --show-error "$index_url" |
+              jq -e --arg version "$version" 'select(.vers == $version and .yanked == false)' >/dev/null
+          }
+
+          wait_for_crate() {
+            local crate="$1"
+
+            for attempt in {1..60}; do
+              if crate_exists "$crate"; then
+                echo "$crate $version is available in the crates.io index"
+                return 0
+              fi
+
+              echo "Waiting for $crate $version to reach the crates.io index ($attempt/60)"
+              sleep 5
+            done
+
+            echo "Timed out waiting for $crate $version in the crates.io index" >&2
+            return 1
+          }
+
+          publish_crate() {
+            local crate="$1"
+
+            if crate_exists "$crate"; then
+              echo "$crate $version is already published; skipping"
+            else
+              cargo publish --locked -p "$crate"
+            fi
+
+            wait_for_crate "$crate"
+          }
+
+          publish_crate arch-titan-types-core
+          publish_crate arch-titan-types-api
+          publish_crate arch-titan-client
