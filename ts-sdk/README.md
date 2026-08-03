@@ -1,6 +1,6 @@
 # Titan Indexer Client SDK for TypeScript
 
-This package provides a TypeScript client for interacting with the [Titan Indexer](https://github.com/titan-io/titan-indexer) for Bitcoin. While the indexer itself is written in Rust, this SDK offers convenient HTTP and TCP clients for TypeScript applications to communicate with the indexer.
+This package provides a TypeScript client for interacting with the [Titan Indexer](https://github.com/Arch-Network/Titan) for Bitcoin. While the indexer itself is written in Rust, this SDK offers convenient HTTP and TCP clients for TypeScript applications to communicate with the indexer.
 
 The HTTP client uses [axios](https://axios-http.com/) to call REST API endpoints, and the TCP client (which works only in Node.js) uses Node's built-in `net` module to subscribe to real-time events.
 
