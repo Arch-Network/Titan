@@ -1,5 +1,6 @@
 use {
     super::Lot,
+    arch_titan_types_core::{Rune, RuneAmount, RuneId, SerializedOutPoint, TxOut},
     bitcoin::ScriptBuf,
     borsh::{BorshDeserialize, BorshSerialize},
     rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet},
@@ -7,7 +8,6 @@ use {
         fmt::Display,
         io::{Read, Result, Write},
     },
-    arch_titan_types_core::{Rune, RuneAmount, RuneId, SerializedOutPoint, TxOut},
 };
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -180,13 +180,6 @@ impl Display for TransactionStateChange {
 }
 
 impl TransactionStateChange {
-    pub fn has_rune_updates(&self) -> bool {
-        self.outputs.iter().any(|output| output.has_runes())
-            || self.etched.is_some()
-            || self.minted.is_some()
-            || !self.burned.is_empty()
-    }
-
     pub fn rune_ids(&self) -> Vec<RuneId> {
         // Unique rune ids
         let mut rune_ids = HashSet::default();

@@ -1,26 +1,28 @@
 use {
+    super::RocksDBError,
     crate::models::{BlockId, Inscription, RuneEntry, TransactionStateChange, TxRuneIndexRef},
-    borsh::{BorshDeserialize, BorshSerialize},
     arch_titan_types_api::Subscription,
     arch_titan_types_core::{Block, MempoolEntry, RuneId, SpenderReference, TxOut},
+    borsh::{BorshDeserialize, BorshSerialize},
 };
 
 pub trait Entry: Sized + BorshDeserialize + BorshSerialize {
-    fn load(value: Vec<u8>) -> Self {
-        BorshDeserialize::deserialize(&mut &value[..]).unwrap()
+    /// Deserializes a stored value. Corrupt or truncated values yield an error instead of
+    /// panicking.
+    fn load(value: &[u8]) -> Result<Self, RocksDBError> {
+        Self::deserialize(&mut &value[..]).map_err(|e| {
+            RocksDBError::Deserialize(format!("{}: {e}", std::any::type_name::<Self>()))
+        })
     }
 
     fn store(self) -> Vec<u8> {
-        let mut serialized = Vec::new();
-        self.serialize(&mut serialized).unwrap();
-        serialized
+        self.store_ref()
     }
 
     /// Serialize the entry by reference without consuming `self`.
     fn store_ref(&self) -> Vec<u8> {
-        let mut serialized = Vec::new();
-        self.serialize(&mut serialized).unwrap();
-        serialized
+        // Writing into a `Vec` cannot fail.
+        borsh::to_vec(self).expect("borsh serialization into a Vec is infallible")
     }
 }
 

@@ -2,7 +2,7 @@ use {
     super::{
         metrics::Metrics,
         settings::Settings,
-        store::{Store, StoreError},
+        store::{InputsOutputs, Store, StoreError},
         updater::Updater,
         zmq::ZmqManager,
     },
@@ -11,7 +11,13 @@ use {
         index::updater::{ReorgError, UpdaterError},
         models::{block_id_to_transaction_status, Inscription, RuneEntry},
     },
+    arch_titan_types_api::{AddressData, AddressTxOut, Pagination, PaginationResponse},
+    arch_titan_types_core::{
+        Block, Event, InscriptionId, MempoolEntry, Rune, RuneAmount, RuneId, SerializedOutPoint,
+        SerializedTxid, Transaction, TransactionStatus, TxOut,
+    },
     bitcoin::{Address, BlockHash, Transaction as BitcoinTransaction},
+    bitcoincore_rpc::Client,
     rustc_hash::FxHashMap as HashMap,
     std::{
         sync::{
@@ -20,11 +26,6 @@ use {
         },
         thread::{self},
         time::Duration,
-    },
-    arch_titan_types_api::{AddressData, AddressTxOut, Pagination, PaginationResponse},
-    arch_titan_types_core::{
-        Block, Event, InscriptionId, MempoolEntry, Rune, RuneAmount, RuneId, SerializedOutPoint,
-        SerializedTxid, Transaction, TransactionStatus, TxOut,
     },
     tokio::{runtime::Runtime, sync::mpsc::Sender},
     tracing::{error, info, warn},
@@ -87,6 +88,8 @@ impl Index {
         }
     }
 
+    /// Check the index settings against the database, recording them (and seeding
+    /// the mainnet genesis rune) in a fresh database.
     pub fn validate_index(&self) -> Result<()> {
         let db_index_addresses = self.db.is_index_addresses()?;
         match (self.settings.index_addresses, db_index_addresses) {
@@ -137,6 +140,8 @@ impl Index {
             _ => {}
         }
 
+        self.updater.insert_genesis_rune()?;
+
         Ok(())
     }
 
@@ -170,6 +175,7 @@ impl Index {
                         "We're getting network connection issues, retrying... {}",
                         e.to_string()
                     );
+                    self.sleep_main_loop_interval();
                     continue;
                 }
                 Err(e) => {
@@ -194,6 +200,7 @@ impl Index {
                         "We're getting network connection issues, retrying... {}",
                         e.to_string()
                     );
+                    self.sleep_main_loop_interval();
                     continue;
                 }
                 Err(e) => {
@@ -208,6 +215,7 @@ impl Index {
                 Ok(_) => (),
                 Err(UpdaterError::InvalidMainChainTip) => {
                     warn!("Invalid main chain tip, when sending tx updates...");
+                    self.sleep_main_loop_interval();
                     continue;
                 }
                 Err(e) => {
@@ -215,12 +223,18 @@ impl Index {
                 }
             }
 
-            thread::sleep(Duration::from_millis(self.settings.main_loop_interval));
+            self.sleep_main_loop_interval();
         }
 
         let rt = Runtime::new().expect("Failed to create runtime");
         rt.block_on(self.zmq_manager.join_zmq_listener());
         info!("Closing indexer");
+    }
+
+    /// Waits one main-loop interval. Retry paths use it too, so a persistent failure
+    /// cannot turn the loop into a busy spin.
+    fn sleep_main_loop_interval(&self) {
+        thread::sleep(Duration::from_millis(self.settings.main_loop_interval));
     }
 
     pub async fn start_zmq_listener(&self) {
@@ -245,8 +259,11 @@ impl Index {
         Ok(self.db.get_block_by_hash(hash)?)
     }
 
-    pub fn get_mempool_txids(&self) -> Result<Vec<SerializedTxid>> {
-        Ok(self.db.get_mempool_txids()?.keys().cloned().collect())
+    pub fn get_mempool_txids(
+        &self,
+        pagination: Pagination,
+    ) -> Result<PaginationResponse<SerializedTxid>> {
+        Ok(self.db.get_mempool_txids_page(pagination)?)
     }
 
     pub fn get_mempool_entry(&self, txid: &SerializedTxid) -> Result<MempoolEntry> {
@@ -260,8 +277,11 @@ impl Index {
         Ok(self.db.get_mempool_entries(txids)?)
     }
 
-    pub fn get_all_mempool_entries(&self) -> Result<HashMap<SerializedTxid, MempoolEntry>> {
-        Ok(self.db.get_mempool_txids()?)
+    pub fn get_mempool_entries_page(
+        &self,
+        pagination: Pagination,
+    ) -> Result<PaginationResponse<(SerializedTxid, MempoolEntry)>> {
+        Ok(self.db.get_mempool_entries_page(pagination)?)
     }
 
     pub fn get_mempool_entries_with_ancestors(
@@ -275,15 +295,6 @@ impl Index {
         Ok(self
             .db
             .get_tx_out_with_mempool_spent_update(outpoint, None)?)
-    }
-
-    pub fn get_tx_outs(
-        &self,
-        outpoints: &[SerializedOutPoint],
-    ) -> Result<HashMap<SerializedOutPoint, TxOut>> {
-        Ok(self
-            .db
-            .get_tx_outs_with_mempool_spent_update(outpoints, None)?)
     }
 
     pub fn get_rune(&self, rune_id: &RuneId) -> Result<RuneEntry> {
@@ -320,67 +331,87 @@ impl Index {
             .get_last_rune_transactions(rune_id, pagination, mempool)?)
     }
 
-    pub fn get_script_pubkey_outpoints(&self, address: &Address) -> Result<AddressData> {
+    /// Balance summary over all of the address's outputs (confirmed plus mempool-created,
+    /// minus those spent in the mempool). Reads every output's `TxOut` but no transactions.
+    pub fn get_address_data(&self, address: &Address) -> Result<AddressData> {
         let script_pubkey = address.script_pubkey();
         let outpoints = self.db.get_script_pubkey_outpoints(&script_pubkey, None)?;
-        let outpoints_to_tx_out = self
+        let tx_outs = self
             .db
             .get_tx_outs_with_mempool_spent_update(&outpoints, None)?;
 
-        // if outpoints.len() != outpoints_to_tx_out.len() {
-        //     error!(
-        //         "Address {} has {} outpoints but {} txouts",
-        //         address,
-        //         outpoints.len(),
-        //         outpoints_to_tx_out.len()
-        //     );
-        // }
+        let mut runes = HashMap::default();
+        let mut value = 0;
+        for tx_out in tx_outs.values() {
+            for rune in tx_out.runes.iter().chain(tx_out.risky_runes.iter()) {
+                runes
+                    .entry(rune.id)
+                    .and_modify(|amount| *amount += rune.amount)
+                    .or_insert(rune.amount);
+            }
+            value += tx_out.value;
+        }
 
-        let outpoint_txns: Vec<SerializedTxid> = outpoints
+        Ok(AddressData {
+            value,
+            runes: runes
+                .into_iter()
+                .map(|(rune_id, amount)| RuneAmount::from((rune_id, amount)))
+                .collect(),
+            output_count: tx_outs.len() as u64,
+        })
+    }
+
+    /// One page of the outputs summarized by `get_address_data`: confirmed outputs in
+    /// outpoint order, then mempool-created ones.
+    pub fn get_address_outputs(
+        &self,
+        address: &Address,
+        pagination: Pagination,
+    ) -> Result<PaginationResponse<AddressTxOut>> {
+        let script_pubkey = address.script_pubkey();
+        let page = self
+            .db
+            .get_script_pubkey_outpoints_page(&script_pubkey, pagination)?;
+        let mut tx_outs = self
+            .db
+            .get_tx_outs_with_mempool_spent_update(&page.items, None)?;
+
+        let txids: Vec<SerializedTxid> = page
+            .items
             .iter()
             .map(|outpoint| outpoint.to_serialized_txid())
             .collect();
+        let confirming_blocks = self.db.get_transaction_confirming_blocks(&txids)?;
 
-        let txns_confirming_block = self.db.get_transaction_confirming_blocks(&outpoint_txns)?;
-
-        let mut runes = HashMap::default();
-        let mut value = 0;
-        let mut outputs = Vec::new();
         let mut tx_sizes: HashMap<SerializedTxid, (u64, u64)> = HashMap::default();
-        for (outpoint, tx_out) in outpoints_to_tx_out {
-            for rune in tx_out.runes.iter() {
-                runes
-                    .entry(rune.id)
-                    .and_modify(|amount| *amount += rune.amount)
-                    .or_insert(rune.amount);
-            }
+        let mut outputs = Vec::with_capacity(page.items.len());
+        for outpoint in &page.items {
+            let Some(tx_out) = tx_outs.remove(outpoint) else {
+                continue;
+            };
 
-            for rune in tx_out.risky_runes.iter() {
-                runes
-                    .entry(rune.id)
-                    .and_modify(|amount| *amount += rune.amount)
-                    .or_insert(rune.amount);
-            }
-
-            value += tx_out.value;
-
-            // Populate transaction size and vsize
-            let txid_ser = outpoint.to_serialized_txid();
-            let (size, weight) = if let Some(s) = tx_sizes.get(&txid_ser) {
-                *s
-            } else {
-                let tx = self.get_transaction(&txid_ser)?;
-                let s = (tx.size, tx.weight);
-                tx_sizes.insert(txid_ser, s);
-                s
+            // Size and weight only need the raw transaction; loading the full API
+            // transaction would also fetch every input's and output's TxOut.
+            let txid = outpoint.to_serialized_txid();
+            let (size, weight) = match tx_sizes.get(&txid) {
+                Some(sizes) => *sizes,
+                None => {
+                    let raw = self.db.get_transaction_raw(&txid, None)?;
+                    let tx: bitcoin::Transaction =
+                        bitcoin::consensus::deserialize(&raw).map_err(|e| {
+                            IndexError::InvalidIndex(format!("corrupt transaction {txid}: {e}"))
+                        })?;
+                    let sizes = (raw.len() as u64, tx.weight().to_wu());
+                    tx_sizes.insert(txid, sizes);
+                    sizes
+                }
             };
 
             let status = block_id_to_transaction_status(
-                txns_confirming_block
-                    .get(&txid_ser)
-                    .and_then(|x| x.as_ref()),
+                confirming_blocks.get(&txid).and_then(|x| x.as_ref()),
             );
-            let output = AddressTxOut {
+            outputs.push(AddressTxOut {
                 txid: outpoint.to_txid(),
                 vout: outpoint.vout(),
                 value: tx_out.value,
@@ -390,17 +421,12 @@ impl Index {
                 status,
                 size,
                 weight,
-            };
-            outputs.push(output);
+            });
         }
 
-        Ok(AddressData {
-            value,
-            runes: runes
-                .into_iter()
-                .map(|(rune_id, amount)| RuneAmount::from((rune_id, amount)))
-                .collect(),
-            outputs,
+        Ok(PaginationResponse {
+            items: outputs,
+            offset: page.offset,
         })
     }
 
@@ -420,7 +446,7 @@ impl Index {
         &self,
         transaction: &BitcoinTransaction,
         txid: &SerializedTxid,
-    ) -> Result<(Vec<Option<TxOut>>, Vec<Option<TxOut>>)> {
+    ) -> Result<InputsOutputs> {
         Ok(self
             .db
             .get_inputs_outputs_from_transaction(transaction, txid)?)
@@ -443,13 +469,13 @@ impl Index {
 
     pub fn get_transactions_statuses(
         &self,
-        txids: &Vec<SerializedTxid>,
+        txids: &[SerializedTxid],
     ) -> Result<HashMap<SerializedTxid, Option<TransactionStatus>>> {
         let (exist, _) = self.db.partition_transactions_by_existence(txids)?;
         let result = self.db.get_transaction_confirming_blocks(&exist)?;
 
         Ok(txids
-            .into_iter()
+            .iter()
             .map(|txid| {
                 let block_id = result.get(txid);
                 match block_id {
@@ -471,17 +497,28 @@ impl Index {
             .remove_pre_index_new_submitted_transaction(txid)?)
     }
 
+    /// Index a transaction this node just broadcast. Uses the caller's `rpc_client`:
+    /// taking another one from the pool while waiting for the updater's broadcast
+    /// lock could exhaust the pool and deadlock concurrent broadcasts.
     pub fn index_new_submitted_transaction(
         &self,
+        rpc_client: &Client,
         txid: &SerializedTxid,
         tx: &BitcoinTransaction,
         mempool_entry: MempoolEntry,
     ) {
-        match self.updater.index_new_submitted_tx(txid, tx, mempool_entry) {
+        match self
+            .updater
+            .index_new_submitted_tx(rpc_client, txid, tx, mempool_entry)
+        {
             Ok(_) => (),
             Err(e) => {
                 error!("Failed to index new transaction after broadcast: {}", e);
             }
         }
+    }
+
+    pub fn get_mempool_count(&self) -> Result<usize> {
+        Ok(self.db.get_mempool_count()?)
     }
 }

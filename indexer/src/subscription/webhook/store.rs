@@ -1,7 +1,7 @@
 use {
     crate::db::{RocksDB, RocksDBError},
-    thiserror::Error,
     arch_titan_types_api::Subscription,
+    thiserror::Error,
     uuid::Uuid,
 };
 
@@ -30,7 +30,6 @@ pub trait Store: Send + Sync {
         id: &Uuid,
         last_success: u64,
     ) -> Result<(), StoreError>;
-    fn get_subscription(&self, id: &Uuid) -> Result<Subscription, StoreError>;
     fn get_subscriptions(&self) -> Result<Vec<Subscription>, StoreError>;
     fn delete_subscription(&self, id: &Uuid) -> Result<(), StoreError>;
 }
@@ -46,10 +45,6 @@ impl Store for RocksDB {
         last_success: u64,
     ) -> Result<(), StoreError> {
         Ok(self.update_subscription_last_success(id, last_success)?)
-    }
-
-    fn get_subscription(&self, id: &Uuid) -> Result<Subscription, StoreError> {
-        Ok(self.get_subscription(id)?)
     }
 
     fn get_subscriptions(&self) -> Result<Vec<Subscription>, StoreError> {

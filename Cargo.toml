@@ -19,7 +19,7 @@ bitcoin-io = { version = "=0.1.2" }
 bitcoincore-rpc = "0.19.0"
 borsh = { version = "1.4.0", features = ["derive"] }
 brotli = "7.0.0"
-clap = { version = "4.5.23", features = ["derive"] }
+clap = { version = "4.5.23", features = ["derive", "env"] }
 derive_more = { version = "1.0.0", features = ["display", "from_str"] }
 hex = "0.4.3"
 http = "1.2.0"
@@ -30,7 +30,7 @@ prometheus = "0.13.4"
 rayon = "1.10.0"
 regex = "1.11.1"
 reqwest = { version = "0.12.12", features = ["json", "blocking"] }
-rocksdb = "0.22.0"
+rocksdb = "0.25.0"
 serde = "1.0.216"
 serde_json = "1.0.133"
 serde_with = "3.11.0"

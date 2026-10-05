@@ -3,10 +3,9 @@ use std::{
     time::Duration,
 };
 
-use serde_json;
-use thiserror::Error;
 use arch_titan_types_api::TcpSubscriptionRequest;
 use arch_titan_types_core::Event;
+use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -109,7 +108,15 @@ impl AsyncTcpClient {
     pub fn new() -> Self {
         Self::new_with_config(Config::default())
     }
+}
 
+impl Default for AsyncTcpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AsyncTcpClient {
     /// Get the current connection status
     pub fn get_status(&self) -> ConnectionStatus {
         self.status_tracker.get_status()
@@ -149,34 +156,24 @@ impl AsyncTcpClient {
     ) -> Result<mpsc::Receiver<Event>, TcpClientError> {
         info!("Subscribing to {}", addr);
 
-        // Check if we already have a worker task running
-        let mut worker_lock = self
+        // Take any existing worker task out of the lock. The std MutexGuard must
+        // not be held across an `.await` (it would make this future !Send).
+        let existing = self
             .worker_task
             .lock()
-            .map_err(|_| TcpClientError::LockError)?;
+            .map_err(|_| TcpClientError::LockError)?
+            .take();
 
         // If there's an existing task, shut it down and join it
-        if let Some(handle) = worker_lock.take() {
+        if let Some(handle) = existing {
             info!("Shutting down existing subscription task before starting a new one");
-            // Send shutdown signal
             self.send_shutdown_signal()?;
-
-            // Create a new shutdown channel for the new task
-            let mut shutdown_guard = self
-                .shutdown_channel
-                .lock()
-                .map_err(|_| TcpClientError::LockError)?;
-            *shutdown_guard = ShutdownChannel::new();
-            drop(shutdown_guard); // Release the lock
 
             // Attempt to join the existing task with a timeout
             match tokio::time::timeout(Duration::from_secs(5), handle).await {
-                Ok(join_result) => match join_result {
-                    Ok(_) => info!("Successfully joined existing task"),
-                    Err(_) => error!("Error joining existing task: it panicked"),
-                },
+                Ok(Ok(_)) => info!("Successfully joined existing task"),
+                Ok(Err(_)) => error!("Error joining existing task: it panicked"),
                 Err(_) => {
-                    // Task didn't complete within timeout
                     error!("Timed out waiting for existing task to complete, proceeding with new task anyway");
                 }
             }
@@ -187,15 +184,17 @@ impl AsyncTcpClient {
 
         // Clone the settings and shutdown receiver for the spawned task.
         let reconnect_settings = self.config.clone();
+        // Always start with a fresh shutdown channel: a previous `shutdown()` has
+        // already signalled the old one, which would stop the new task immediately.
         let shutdown_receiver = {
-            let guard = self
+            let mut guard = self
                 .shutdown_channel
                 .lock()
                 .map_err(|_| TcpClientError::LockError)?;
+            *guard = ShutdownChannel::new();
             guard.get_receiver()
         };
         let addr = addr.to_owned();
-        let subscription_request = subscription_request;
         let status_tracker = self.status_tracker.clone();
 
         // Set initial status to Connecting
@@ -217,13 +216,8 @@ impl AsyncTcpClient {
             // Use the shutdown receiver
             let mut shutdown_rx = shutdown_receiver;
 
-            // Ping-pong monitoring
             let ping_interval = reconnect_settings.ping_interval;
             let pong_timeout = reconnect_settings.pong_timeout;
-            let mut last_pong_time = std::time::Instant::now();
-            let mut ping_timer = tokio::time::interval(ping_interval);
-            ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut awaiting_pong = false;
 
             loop {
                 // Before each connection attempt, check for a shutdown signal.
@@ -236,46 +230,47 @@ impl AsyncTcpClient {
                 update_status(ConnectionStatus::Connecting);
 
                 match TcpStream::connect(&addr).await {
-                    Ok(stream) => {
+                    Ok(stream) => 'session: {
                         info!("Connected to {}.", addr);
                         update_status(ConnectionStatus::Connected);
 
-                        // Reset reconnection attempts after successful connection
-                        reconnection_manager.reset();
+                        // Backoff is only reset once the session proves healthy
+                        // (first event or PONG), so a server that accepts and
+                        // immediately drops connections still backs off.
+                        let mut session_healthy = false;
 
                         let (reader, mut writer) = stream.into_split();
                         let mut reader = BufReader::new(reader);
 
-                        // Ping-pong monitoring
-                        let ping_interval = reconnect_settings.ping_interval;
-                        let pong_timeout = reconnect_settings.pong_timeout;
-                        let mut last_pong_time = std::time::Instant::now();
-                        let mut ping_timer = tokio::time::interval(ping_interval);
+                        // Ping-pong monitoring: send a PING every `ping_interval`,
+                        // and expect a PONG (or any event) within `pong_timeout`.
+                        let mut ping_timer = tokio::time::interval_at(
+                            tokio::time::Instant::now() + ping_interval,
+                            ping_interval,
+                        );
                         ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                        let mut awaiting_pong = false;
+                        let mut pong_deadline: Option<tokio::time::Instant> = None;
 
                         // Serialize and send the subscription request.
-                        match serde_json::to_string(&subscription_request) {
-                            Ok(req_json) => {
-                                if let Err(e) = writer.write_all(req_json.as_bytes()).await {
-                                    error!("Error sending subscription request: {}", e);
-                                    // Let the reconnect loop try again.
-                                    continue;
-                                }
-                                if let Err(e) = writer.write_all(b"\n").await {
-                                    error!("Error writing newline: {}", e);
-                                    continue;
-                                }
-                                if let Err(e) = writer.flush().await {
-                                    error!("Error flushing writer: {}", e);
-                                    continue;
-                                }
-                            }
+                        let req_json = match serde_json::to_string(&subscription_request) {
+                            Ok(req_json) => req_json,
                             Err(e) => {
                                 error!("Error serializing subscription request: {}", e);
                                 update_status(ConnectionStatus::Disconnected);
-                                break;
+                                return;
                             }
+                        };
+                        let write_result = async {
+                            writer.write_all(req_json.as_bytes()).await?;
+                            writer.write_all(b"\n").await?;
+                            writer.flush().await
+                        }
+                        .await;
+                        if let Err(e) = write_result {
+                            error!("Error sending subscription request: {}", e);
+                            update_status(ConnectionStatus::Reconnecting);
+                            // Fall through to the backoff delay below.
+                            break 'session;
                         }
 
                         // Initialize the byte buffer with the configured capacity
@@ -301,61 +296,50 @@ impl AsyncTcpClient {
                                             update_status(ConnectionStatus::Reconnecting);
                                             break; // Break inner loop to trigger reconnect
                                         }
-                                        Ok(n) if n > 0 => {
-                                            // We read n bytes, including the newline.
-                                            // Process the received bytes.
-                                            // Note: read_until includes the delimiter in the buffer.
-                                            // Trim whitespace and the trailing newline before processing.
-                                            let message_bytes = byte_buf.trim_ascii_end(); // Efficient trim for ASCII/UTF8 whitespace + newline
+                                        Ok(_) => {
+                                            // read_until includes the delimiter; trim it before processing.
+                                            let message_bytes = byte_buf.trim_ascii_end();
 
-                                            if !message_bytes.is_empty() {
-                                                // Check if this is a pong response
-                                                if message_bytes == b"PONG" {
-                                                    if awaiting_pong {
-                                                        awaiting_pong = false;
-                                                        last_pong_time = std::time::Instant::now();
-                                                        debug!("Received PONG");
-                                                    }
-                                                } else {
-                                                    // Check if message size exceeds limit *before* parsing JSON
-                                                    if message_bytes.len() > reconnect_settings.max_buffer_size {
-                                                        error!(
-                                                            "Received message exceeds maximum allowed size ({}), skipping. Message starts with: {:?}",
-                                                            reconnect_settings.max_buffer_size,
-                                                            String::from_utf8_lossy(&message_bytes[..std::cmp::min(message_bytes.len(), 50)]) // Log first 50 bytes
-                                                        );
-                                                        // Note: We don't break here, just clear the buffer and continue reading the next message.
-                                                    } else {
-                                                        // Try to parse as an event from the byte slice
-                                                        match serde_json::from_slice::<Event>(message_bytes) {
-                                                            Ok(event) => {
-                                                                // Every successful message resets pong timer
-                                                                last_pong_time = std::time::Instant::now();
-                                                                awaiting_pong = false; // Also reset awaiting_pong if we received a valid event
-                                                                if let Err(e) = tx.send(event).await {
-                                                                    error!("Failed to send event to channel: {}", e);
-                                                                    update_status(ConnectionStatus::Disconnected); // Channel broken, can't continue
-                                                                    return; // Exit the task
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                error!(
-                                                                    "Failed to parse event: {}. Raw data (first 100 bytes): {:?}",
-                                                                    e,
-                                                                    String::from_utf8_lossy(&message_bytes[..std::cmp::min(message_bytes.len(), 100)])
-                                                                );
-                                                                update_status(ConnectionStatus::Reconnecting);
-                                                                break;
-                                                            }
+                                            if message_bytes == b"PONG" {
+                                                debug!("Received PONG");
+                                                pong_deadline = None;
+                                                if !session_healthy {
+                                                    session_healthy = true;
+                                                    reconnection_manager.reset();
+                                                }
+                                            } else if message_bytes.len() > reconnect_settings.max_buffer_size {
+                                                error!(
+                                                    "Received message exceeds maximum allowed size ({}), skipping. Message starts with: {:?}",
+                                                    reconnect_settings.max_buffer_size,
+                                                    String::from_utf8_lossy(&message_bytes[..std::cmp::min(message_bytes.len(), 50)])
+                                                );
+                                            } else if !message_bytes.is_empty() {
+                                                match serde_json::from_slice::<Event>(message_bytes) {
+                                                    Ok(event) => {
+                                                        // Any event proves the connection is alive.
+                                                        pong_deadline = None;
+                                                        if !session_healthy {
+                                                            session_healthy = true;
+                                                            reconnection_manager.reset();
                                                         }
+                                                        if let Err(e) = tx.send(event).await {
+                                                            error!("Failed to send event to channel: {}", e);
+                                                            update_status(ConnectionStatus::Disconnected); // Channel broken, can't continue
+                                                            return; // Exit the task
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        error!(
+                                                            "Failed to parse event: {}. Raw data (first 100 bytes): {:?}",
+                                                            e,
+                                                            String::from_utf8_lossy(&message_bytes[..std::cmp::min(message_bytes.len(), 100)])
+                                                        );
+                                                        update_status(ConnectionStatus::Reconnecting);
+                                                        break;
                                                     }
                                                 }
                                             }
                                             // Clear the buffer for the next message AFTER processing the current one
-                                            byte_buf.clear();
-                                        }
-                                        Ok(_) => {
-                                            // n == 0, should be handled by Ok(0) case, but safety belt
                                             byte_buf.clear();
                                         }
                                         Err(e) => {
@@ -365,34 +349,23 @@ impl AsyncTcpClient {
                                         }
                                     }
                                 }
-                                _ = ping_timer.tick() => {
-                                    // Time to send a ping
-                                    if awaiting_pong {
-                                        // We're still waiting for a pong from the previous ping
-                                        let elapsed = last_pong_time.elapsed();
-                                        if elapsed > pong_timeout {
-                                            warn!("Pong response timed out after {:?}, considering connection dead", elapsed);
-                                            update_status(ConnectionStatus::Reconnecting);
-                                            break;
-                                        }
-                                    } else {
-                                        // Send a ping
-                                        match writer.write_all(b"PING\n").await {
-                                            Ok(_) => {
-                                                if let Err(e) = writer.flush().await {
-                                                    error!("Failed to flush ping: {}", e);
-                                                    update_status(ConnectionStatus::Reconnecting);
-                                                    break;
-                                                }
-                                                awaiting_pong = true;
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to send ping: {}", e);
-                                                update_status(ConnectionStatus::Reconnecting);
-                                                break;
-                                            }
-                                        }
+                                _ = ping_timer.tick(), if pong_deadline.is_none() => {
+                                    let ping_result = async {
+                                        writer.write_all(b"PING\n").await?;
+                                        writer.flush().await
                                     }
+                                    .await;
+                                    if let Err(e) = ping_result {
+                                        error!("Failed to send ping: {}", e);
+                                        update_status(ConnectionStatus::Reconnecting);
+                                        break;
+                                    }
+                                    pong_deadline = Some(tokio::time::Instant::now() + pong_timeout);
+                                }
+                                _ = tokio::time::sleep_until(pong_deadline.unwrap_or_else(tokio::time::Instant::now)), if pong_deadline.is_some() => {
+                                    warn!("Pong response timed out after {:?}, considering connection dead", pong_timeout);
+                                    update_status(ConnectionStatus::Reconnecting);
+                                    break;
                                 }
                                 _ = shutdown_rx.changed() => {
                                     info!("Shutdown signal received. Exiting TCP subscription task.");
@@ -438,7 +411,10 @@ impl AsyncTcpClient {
         });
 
         // Store the task handle
-        *worker_lock = Some(handle);
+        *self
+            .worker_task
+            .lock()
+            .map_err(|_| TcpClientError::LockError)? = Some(handle);
 
         Ok(rx)
     }
@@ -455,8 +431,7 @@ impl AsyncTcpClient {
 
         if let Err(e) = channel.send() {
             error!("Failed to send shutdown signal: {:?}", e);
-            return Err(TcpClientError::IOError(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(TcpClientError::IOError(std::io::Error::other(
                 "Failed to send shutdown signal",
             )));
         }
@@ -490,14 +465,14 @@ impl AsyncTcpClient {
     /// Waits for the worker task to complete.
     /// Returns Ok(()) if the task was successfully joined, or an error if joining failed.
     pub async fn join(&self) -> Result<(), TcpClientError> {
-        // Acquire the lock on the worker task
-        let mut worker_lock = self
+        // Take the task handle out without holding the lock across the await.
+        let handle = self
             .worker_task
             .lock()
-            .map_err(|_| TcpClientError::LockError)?;
+            .map_err(|_| TcpClientError::LockError)?
+            .take();
 
-        // Take the task handle out (replacing it with None)
-        if let Some(handle) = worker_lock.take() {
+        if let Some(handle) = handle {
             match handle.await {
                 Ok(_) => {
                     info!("Successfully joined worker task");
@@ -529,14 +504,13 @@ impl Drop for AsyncTcpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{SocketAddr, TcpListener};
-    use std::sync::Arc;
-    use std::sync::Once;
     use arch_titan_types_core::EventType;
+    use std::net::SocketAddr;
+
+    use std::sync::Once;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener as TokioTcpListener;
-    use tokio::select;
-    use tokio::signal::unix::{signal, SignalKind};
+
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
     use tokio::time::sleep;
@@ -548,8 +522,8 @@ mod tests {
     fn init_test_logger() {
         INIT.call_once(|| {
             // Initialize a subscriber that prints all logs to stderr
-            let filter =
-                EnvFilter::from_default_env().add_directive("arch_titan_client=trace".parse().unwrap());
+            let filter = EnvFilter::from_default_env()
+                .add_directive("arch_titan_client=trace".parse().unwrap());
 
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
@@ -691,6 +665,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resubscribe_after_shutdown_and_join_receives_events() {
+        init_test_logger();
+        let (_server, addr, server_shutdown) = start_async_test_server().await;
+        let client = AsyncTcpClient::new_with_config(Config {
+            retry_delay: Duration::from_millis(50),
+            ..Config::default()
+        });
+        let request = || TcpSubscriptionRequest {
+            subscribe: vec![EventType::TransactionsAdded],
+        };
+
+        let mut rx = client
+            .subscribe(&addr.to_string(), request())
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .is_some());
+        client.shutdown_and_join().await.unwrap();
+
+        // A subscribe after shutdown must use a fresh shutdown channel.
+        let mut rx = client
+            .subscribe(&addr.to_string(), request())
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .is_some());
+
+        client.shutdown_and_join().await.unwrap();
+        let _ = server_shutdown.send(());
+    }
+
+    #[test]
+    fn test_client_futures_are_send() {
+        fn assert_send<T: Send>(_: T) {}
+        let client = AsyncTcpClient::new();
+        assert_send(client.subscribe("127.0.0.1:1", TcpSubscriptionRequest { subscribe: vec![] }));
+        assert_send(client.join());
+        assert_send(client.shutdown_and_join());
+    }
+
+    #[tokio::test]
     async fn test_shutdown_and_join() {
         // Initialize logging for tests
         init_test_logger();
@@ -814,7 +833,7 @@ mod tests {
         };
 
         info!("Subscribing to test server at {}", server_addr);
-        let rx = client
+        let _rx = client
             .subscribe(
                 &format!("127.0.0.1:{}", server_addr.port()),
                 subscription_request,
@@ -902,15 +921,15 @@ mod tests {
             error!("Timeout waiting for event: {}", e);
             // Try to diagnose what happened
             info!("Current client status: {:?}", client.get_status());
-            assert!(false, "Failed to receive event within timeout");
+            panic!("Failed to receive event within timeout");
         }
 
         let event = event.unwrap();
 
-        if let None = &event {
+        if event.is_none() {
             error!("Received None from channel - sender was likely dropped");
             info!("Current client status: {:?}", client.get_status());
-            assert!(false, "Expected Some(event) but got None");
+            panic!("Expected Some(event) but got None");
         }
 
         match event.unwrap() {
@@ -965,7 +984,7 @@ mod tests {
         };
 
         info!("Subscribing to non-existent server to test error handling");
-        let rx = client
+        let _rx = client
             .subscribe("127.0.0.1:1", subscription_request)
             .await
             .unwrap();
@@ -1017,7 +1036,7 @@ mod tests {
         };
 
         info!("Subscribing to non-existent server to trigger reconnection");
-        let rx = client
+        let _rx = client
             .subscribe("127.0.0.1:1", subscription_request)
             .await
             .unwrap();

@@ -70,9 +70,9 @@ impl fmt::Display for EventType {
     }
 }
 
-impl Into<String> for EventType {
-    fn into(self) -> String {
-        self.to_string()
+impl From<EventType> for String {
+    fn from(val: EventType) -> Self {
+        val.to_string()
     }
 }
 

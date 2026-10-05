@@ -1,10 +1,10 @@
 use {
+    arch_titan_types_core::{RuneId, SpacedRune},
     bitcoin::BlockHash,
     std::{
         fmt::{self, Display},
         str::FromStr,
     },
-    arch_titan_types_core::{RuneId, SpacedRune},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -42,11 +42,11 @@ impl Display for Block {
     }
 }
 
-impl Into<String> for Block {
-    fn into(self) -> String {
-        match self {
-            Self::Height(height) => height.to_string(),
-            Self::Hash(hash) => hash.to_string(),
+impl From<Block> for String {
+    fn from(val: Block) -> Self {
+        match val {
+            Block::Height(height) => height.to_string(),
+            Block::Hash(hash) => hash.to_string(),
         }
     }
 }
@@ -88,11 +88,11 @@ impl Display for Rune {
     }
 }
 
-impl Into<String> for Rune {
-    fn into(self) -> String {
-        match self {
-            Self::Spaced(rune) => rune.to_string(),
-            Self::Id(id) => id.to_string(),
+impl From<Rune> for String {
+    fn from(val: Rune) -> Self {
+        match val {
+            Rune::Spaced(rune) => rune.to_string(),
+            Rune::Id(id) => id.to_string(),
         }
     }
 }

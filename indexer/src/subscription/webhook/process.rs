@@ -1,15 +1,14 @@
 use {
-    super::store::Store,
-    reqwest::Client,
-    std::{
-        sync::Arc,
-        time::{Duration, SystemTime, UNIX_EPOCH},
-    },
-    thiserror::Error,
+    super::manager::{now_secs, SubscriptionManager},
     arch_titan_types_core::{Event, EventType},
+    reqwest::Client,
+    std::{sync::Arc, time::Duration},
+    thiserror::Error,
     tokio::time::sleep,
-    tracing::error,
+    tracing::{error, warn},
 };
+
+const MAX_RETRIES: usize = 5;
 
 #[derive(Debug, Error)]
 pub enum SendEventError {
@@ -57,43 +56,38 @@ async fn send_event_with_retry(
     }
 }
 
-/// Process an event and send it to all interested webhook subscriptions
-pub async fn process_event(
-    store: &Arc<dyn Store>,
-    client: &Client,
-    event: &Event,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Determine event type
+/// Spawn one delivery task per interested subscription. Each task holds a
+/// permit from the manager's delivery semaphore; when none are free the
+/// delivery is dropped so the dispatcher (and the indexer feeding it) never waits.
+pub fn process_event(manager: &Arc<SubscriptionManager>, event: &Event) {
     let event_type = EventType::from(event.clone());
-
-    // Get all subscriptions from DB
-    if let Ok(subscriptions) = store.get_subscriptions() {
-        // Filter subscriptions interested in this event type
-        let interested: Vec<_> = subscriptions
-            .into_iter()
-            .filter(|sub| sub.event_types.contains(&event_type))
-            .collect();
-
-        // For each subscription, dispatch the event asynchronously
-        for sub in interested {
-            let client_clone = client.clone();
-            let endpoint = sub.endpoint.clone();
-            let event_clone = event.clone();
-            let store_clone = store.clone();
-            tokio::spawn(async move {
-                let result = send_event_with_retry(&client_clone, &endpoint, &event_clone, 5).await;
-
-                if result.is_ok() {
-                    // Mark subscription as successful
-                    let now_secs = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let _ = store_clone.update_subscription_last_success(&sub.id, now_secs);
-                }
-            });
-        }
+    let interested = manager.interested(&event_type);
+    if interested.is_empty() {
+        return;
     }
 
-    Ok(())
+    let event = Arc::new(event.clone());
+    for (id, endpoint) in interested {
+        let Ok(permit) = manager.deliveries().clone().try_acquire_owned() else {
+            warn!(
+                "Webhook delivery capacity exhausted, dropping {:?} event for subscription {}",
+                event_type, id
+            );
+            continue;
+        };
+
+        let manager = manager.clone();
+        let event = event.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result =
+                send_event_with_retry(manager.client(), &endpoint, &event, MAX_RETRIES).await;
+
+            if result.is_ok() {
+                if let Err(e) = manager.mark_success(&id, now_secs()) {
+                    error!("Failed to record webhook success for {}: {:?}", id, e);
+                }
+            }
+        });
+    }
 }

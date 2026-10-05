@@ -1,7 +1,7 @@
 use {
     crate::models::TransactionStateChangeInput,
-    std::{collections::HashSet, fmt::Display},
     arch_titan_types_core::{SerializedOutPoint, SerializedTxid},
+    std::{collections::HashSet, fmt::Display},
 };
 
 #[derive(Debug, Default, Clone)]
@@ -20,21 +20,6 @@ impl BatchDelete {
             spent_outpoints_in_mempool: HashSet::new(),
             tx_state_changes: HashSet::new(),
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.tx_outs.is_empty()
-            && self.script_pubkeys_outpoints.is_empty()
-            && self.spent_outpoints_in_mempool.is_empty()
-            && self.tx_state_changes.is_empty()
-    }
-
-    /// Empties all collections while preserving their allocated capacity.
-    pub fn clear(&mut self) {
-        self.tx_outs.clear();
-        self.script_pubkeys_outpoints.clear();
-        self.spent_outpoints_in_mempool.clear();
-        self.tx_state_changes.clear();
     }
 }
 

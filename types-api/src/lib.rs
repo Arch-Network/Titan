@@ -1,5 +1,6 @@
 pub use {
     address::{AddressData, AddressTxOut},
+    mempool::MempoolTxEntry,
     pagination::{Pagination, PaginationResponse},
     rune::{MintResponse, RuneResponse},
     stats::{BlockTip, Status},
@@ -7,6 +8,7 @@ pub use {
 };
 
 mod address;
+mod mempool;
 mod pagination;
 pub mod query;
 mod rune;

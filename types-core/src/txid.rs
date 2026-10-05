@@ -85,7 +85,7 @@ impl From<&SerializedTxid> for Txid {
 
 impl std::fmt::Debug for SerializedTxid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        write!(f, "SerializedTxid({})", self)
     }
 }
 
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn test_serialized_txid_clone_copy() {
         let original = create_test_txid();
-        let cloned = original.clone();
+        let cloned = original;
         let copied = original;
 
         assert_eq!(original, cloned);
@@ -430,8 +430,8 @@ mod tests {
             },
             {
                 let mut pattern = [0u8; 32];
-                for i in 0..32 {
-                    pattern[i] = i as u8;
+                for (i, byte) in pattern.iter_mut().enumerate() {
+                    *byte = i as u8;
                 }
                 pattern
             },

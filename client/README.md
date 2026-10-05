@@ -233,7 +233,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   Retrieves a list of transaction IDs in a block.
 
 - **get_address(address: &str)**: `Result<AddressData, Error>`  
-  Retrieves information for a Bitcoin address (balance, outputs, etc.).
+  Retrieves an address's balance summary: `value`, `runes` and `output_count`.
+
+- **get_address_outputs(address: &str, pagination: Option<Pagination>)**: `Result<PaginationResponse<AddressTxOut>, Error>`  
+  Retrieves one page (at most 50) of the address's outputs: confirmed outputs in outpoint
+  order, then mempool-created ones; outputs spent in the mempool are left out. Pass the
+  returned `offset` as the next `skip`; an empty page means the end.
 
 - **get_transaction(txid: &str)**: `Result<Transaction, Error>`  
   Retrieves a detailed transaction object, including runic information.
@@ -262,8 +267,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **get_rune_transactions(rune: &str, pagination: Option<Pagination>)**: `Result<PaginationResponse<Txid>, Error>`  
   Retrieves transactions involving a given rune.
 
-- **get_mempool_txids()**: `Result<Vec<Txid>, Error>`  
-  Retrieves the current mempool transaction IDs.
+- **get_mempool_txids(pagination: Option<Pagination>)**: `Result<PaginationResponse<Txid>, Error>`  
+  Retrieves one page (default and maximum 1000) of mempool txids, in txid byte order.
 
 - **get_mempool_entry(txid: &str)**: `Result<MempoolEntry, Error>`  
   Retrieves a specific mempool entry by its txid.
@@ -271,8 +276,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **get_mempool_entries(txids: &[Txid])**: `Result<HashMap<Txid, Option<MempoolEntry>>, Error>`  
   Retrieves multiple mempool entries by their txids.
 
-- **get_all_mempool_entries()**: `Result<HashMap<Txid, MempoolEntry>, Error>`  
-  Retrieves all mempool entries.
+- **list_mempool_entries(pagination: Option<Pagination>)**: `Result<PaginationResponse<MempoolTxEntry>, Error>`  
+  Retrieves one page (at most 50) of `{ txid, entry }` mempool entries, in txid byte order.
+
+Webhook subscription methods require the server's admin token. Configure it with
+`TitanClient::new(url).with_admin_token(token)` (same for `TitanBlockingClient`);
+it is sent as `Authorization: Bearer <token>`.
 
 - **get_subscription(id: &str)**: `Result<Subscription, Error>`  
   Retrieves a subscription by its ID.

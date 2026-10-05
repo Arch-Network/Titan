@@ -1,8 +1,10 @@
-use rand;
 use std::time::Duration;
 use tracing::info;
 
-use super::{tcp_client, tcp_client_blocking};
+#[cfg(feature = "tcp_client")]
+use super::tcp_client;
+#[cfg(feature = "tcp_client_blocking")]
+use super::tcp_client_blocking;
 
 /// Configuration settings for connection retry and backoff strategy
 #[derive(Debug, Clone)]
@@ -85,22 +87,22 @@ impl ReconnectionManager {
             }
         }
 
-        // Calculate exponential backoff with clamping to max_interval
+        // Calculate exponential backoff (in milliseconds, so sub-second bases
+        // don't truncate to zero) with clamping to max_interval
         let exponent = std::cmp::min(self.current_attempt, 10); // Prevent potential overflow
-        let backoff_secs = std::cmp::min(
-            self.config.base_interval.as_secs() * (1 << exponent),
-            self.config.max_interval.as_secs(),
-        );
+        let base_ms = self.config.base_interval.as_millis() as u64;
+        let max_ms = self.config.max_interval.as_millis() as u64;
+        let backoff_ms = std::cmp::min(base_ms.saturating_mul(1 << exponent), max_ms);
 
         // Add jitter if configured (to prevent thundering herd problem)
-        let final_secs = if self.config.use_jitter {
-            let jitter = rand::random::<u64>() % (backoff_secs / 4 + 1);
-            backoff_secs + jitter
+        let final_ms = if self.config.use_jitter {
+            let jitter = rand::random::<u64>() % (backoff_ms / 4 + 1);
+            backoff_ms + jitter
         } else {
-            backoff_secs
+            backoff_ms
         };
 
-        let wait_time = Duration::from_secs(final_secs);
+        let wait_time = Duration::from_millis(final_ms);
 
         info!(
             "Reconnection attempt {}/{:?} scheduled in {:?}",
@@ -121,6 +123,7 @@ impl ReconnectionManager {
     }
 }
 
+#[cfg(feature = "tcp_client_blocking")]
 /// Convert from the sync client's TcpClientConfig to ReconnectionConfig
 pub fn from_tcp_client_config(config: &tcp_client_blocking::TcpClientConfig) -> ReconnectionConfig {
     ReconnectionConfig {
@@ -132,10 +135,14 @@ pub fn from_tcp_client_config(config: &tcp_client_blocking::TcpClientConfig) -> 
 }
 
 /// Convert from the async client's ReconnectSettings to ReconnectionConfig
+///
+/// The async config has no explicit cap, so backoff is capped at
+/// `max(retry_delay, 60s)`.
+#[cfg(feature = "tcp_client")]
 pub fn from_async_reconnect_settings(settings: &tcp_client::Config) -> ReconnectionConfig {
     ReconnectionConfig {
         base_interval: settings.retry_delay,
-        max_interval: settings.retry_delay, // No max interval in async client, use same as base
+        max_interval: settings.retry_delay.max(Duration::from_secs(60)),
         max_attempts: settings.max_retries,
         use_jitter: false, // Async client doesn't use jitter
     }
@@ -191,6 +198,20 @@ mod tests {
 
         // Then we should get None
         assert!(manager.next_delay().is_none());
+    }
+
+    #[test]
+    fn test_sub_second_base_interval_is_not_truncated() {
+        let mut manager = ReconnectionManager::new(ReconnectionConfig {
+            base_interval: Duration::from_millis(100),
+            max_interval: Duration::from_millis(500),
+            max_attempts: None,
+            use_jitter: false,
+        });
+
+        assert_eq!(manager.next_delay().unwrap(), Duration::from_millis(200));
+        assert_eq!(manager.next_delay().unwrap(), Duration::from_millis(400));
+        assert_eq!(manager.next_delay().unwrap(), Duration::from_millis(500));
     }
 
     #[test]

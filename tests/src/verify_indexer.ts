@@ -2,7 +2,12 @@
 
 import axios from 'axios';
 import * as bitcoin from 'bitcoinjs-lib';
-import { AddressData, BlockTip } from '@titanbtcio/sdk';
+import {
+  AddressData,
+  AddressTxOut,
+  BlockTip,
+  PaginationResponse,
+} from '@titanbtcio/sdk';
 
 // --- INTERFACES & TYPES ---
 
@@ -52,7 +57,7 @@ interface RuneResponse {
   mint?: any;
   pending_burns: string;
   pending_mints: string;
-  inscription_id?: string;
+  inscription_id?: { txid: string; index: number };
   timestamp: number;
   turbo: boolean;
 }
@@ -98,7 +103,11 @@ async function fetchElectrsTip(): Promise<BlockTip> {
     axios.get<string>(heightUrl),
     axios.get<string>(hashUrl),
   ]);
-  return { height: parseInt(hRes.data, 10), hash: hashRes.data };
+  return {
+    height: parseInt(hRes.data, 10),
+    hash: hashRes.data,
+    is_at_tip: true,
+  };
 }
 
 async function fetchIndexerBlockHashByHeight(height: number): Promise<string> {
@@ -144,10 +153,37 @@ async function fetchElectrsTxOutspend(
   return res.data;
 }
 
-async function fetchIndexerAddressData(address: string): Promise<AddressData> {
-  const url = `${INDEXER_BASE_URL}/address/${address}`;
-  const res = await axios.get<AddressData>(url);
-  return res.data;
+type IndexerAddress = AddressData & { outputs: AddressTxOut[] };
+
+/** Fetches the address summary and walks every page of its outputs. */
+async function fetchIndexerAddressData(
+  address: string,
+): Promise<IndexerAddress> {
+  const summary = (
+    await axios.get<AddressData>(`${INDEXER_BASE_URL}/address/${address}`)
+  ).data;
+
+  const outputs: AddressTxOut[] = [];
+  let skip = 0;
+  for (;;) {
+    const page = (
+      await axios.get<PaginationResponse<AddressTxOut>>(
+        `${INDEXER_BASE_URL}/address/${address}/outputs`,
+        { params: { skip, limit: 50 } },
+      )
+    ).data;
+    if (page.items.length === 0) break;
+    outputs.push(...page.items);
+    skip = page.offset;
+  }
+
+  if (outputs.length !== summary.output_count) {
+    console.error(
+      `Address ${address}: summary counts ${summary.output_count} outputs, pages returned ${outputs.length}`,
+    );
+  }
+
+  return { ...summary, outputs };
 }
 
 async function fetchElectrsAddressUTXOs(
@@ -304,7 +340,7 @@ async function main(): Promise<void> {
     // For each modified address, perform checks.
     for (const address of addressesModified) {
       console.log(`Verifying address ${address}...`);
-      let indexerData: AddressData;
+      let indexerData: IndexerAddress;
       let electrsUTXOs: ElectrsUTXO[];
       let maestroUTXOs: MaestroUTXO[];
       try {
@@ -439,7 +475,7 @@ async function main(): Promise<void> {
         const mergedRunes = o.runes;
         for (const rune of o.risky_runes) {
           const existingRune = mergedRunes.find(
-            (r) => r.rune_id === rune.rune_id,
+            (r) => r.id === rune.id,
           );
           if (existingRune) {
             existingRune.amount = (
@@ -453,7 +489,8 @@ async function main(): Promise<void> {
         return {
           txid: o.txid,
           vout: Number(o.vout),
-          runes: mergedRunes,
+          // Indexer RuneAmount uses `id`; normalize to Maestro's `rune_id`.
+          runes: mergedRunes.map((r) => ({ rune_id: r.id, amount: r.amount })),
         };
       });
 

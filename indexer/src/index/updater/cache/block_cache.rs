@@ -1,13 +1,13 @@
 use std::{num::NonZeroUsize, sync::Arc};
 
-use bitcoin::{consensus, BlockHash, ScriptBuf, Transaction};
-use clru::CLruCache;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use arch_titan_types_core::{
     Block, Event, Location, SerializedOutPoint, SerializedTxid, SpenderReference, SpentStatus,
     TxOut,
 };
 use arch_titan_types_core::{Rune, RuneId};
+use bitcoin::{consensus, BlockHash, ScriptBuf, Transaction};
+use clru::CLruCache;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::info;
 
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
             events::Events,
             store_lock::StoreWithLock,
             transaction::TransactionStore,
+            UpdaterError,
         },
         Chain, Settings, StoreError,
     },
@@ -27,6 +28,11 @@ use crate::{
 };
 
 type Result<T> = std::result::Result<T, StoreError>;
+/// Blocks by height, and the inputs of their transactions by txid.
+type PrecachedBlocks = (
+    HashMap<u64, Block>,
+    HashMap<SerializedTxid, Vec<TransactionStateChangeInput>>,
+);
 
 pub struct BlockCacheSettings {
     pub max_recoverable_reorg_depth: u64,
@@ -127,10 +133,7 @@ impl BlockCache {
         db: &Arc<StoreWithLock>,
         purge_count: u64,
         block_count: u64,
-    ) -> Result<(
-        HashMap<u64, Block>,
-        HashMap<SerializedTxid, Vec<TransactionStateChangeInput>>,
-    )> {
+    ) -> Result<PrecachedBlocks> {
         let blocks = {
             let blocks = db.read().get_blocks_by_heights(purge_count, block_count)?;
             let mut result = HashMap::default();
@@ -151,14 +154,7 @@ impl BlockCache {
         let spent_outpoints = tx_state_changes
             .into_iter()
             .map(|(txid, tx_state_change)| {
-                (
-                    txid,
-                    tx_state_change
-                        .inputs
-                        .into_iter()
-                        .map(|input| input)
-                        .collect::<Vec<_>>(),
-                )
+                (txid, tx_state_change.inputs.into_iter().collect::<Vec<_>>())
             })
             .collect::<HashMap<SerializedTxid, Vec<TransactionStateChangeInput>>>();
 
@@ -173,7 +169,7 @@ impl BlockCache {
         self.update.block_count
     }
 
-    fn increment_block_count(&mut self) -> () {
+    fn increment_block_count(&mut self) {
         self.last_block_height = Some(self.update.block_count);
         self.update.block_count += 1;
     }
@@ -181,7 +177,7 @@ impl BlockCache {
     pub fn get_block_hash(&mut self, height: u64) -> Result<BlockHash> {
         // 1. Check current in-memory update.
         if let Some(hash) = self.update.block_hashes.get(&height) {
-            return Ok(hash.clone());
+            return Ok(*hash);
         }
 
         // 2. Check any pending batches that have been flushed but not yet persisted.
@@ -198,7 +194,7 @@ impl BlockCache {
         Ok(hash)
     }
 
-    pub fn set_new_block(&mut self, block: Block) -> () {
+    pub fn set_new_block(&mut self, block: Block) {
         assert_eq!(
             self.get_block_count(),
             block.height,
@@ -216,12 +212,17 @@ impl BlockCache {
     }
 
     fn get_tx_out(&mut self, outpoint: &SerializedOutPoint) -> Result<TxOut> {
-        // 1. Check current in-memory update.
+        // 1. Check the read cache.
         if let Some(tx_out) = self.outpoints.get(outpoint) {
             return Ok(tx_out.clone());
         }
 
-        // 2. Check any pending batches that have been flushed but not yet persisted.
+        // 2. Check current in-memory update: the read cache may have evicted it.
+        if let Some(tx_out) = self.update.txouts.get(outpoint) {
+            return Ok(tx_out.clone());
+        }
+
+        // 3. Check any pending batches that have been flushed but not yet persisted.
         if let Some(tx_out) = self
             .bg_writer
             .find_in_pending(|b| b.txouts.get(outpoint).cloned())
@@ -229,7 +230,7 @@ impl BlockCache {
             return Ok(tx_out);
         }
 
-        // 3. Fall back to the persistent store.
+        // 4. Fall back to the persistent store.
         let tx_out = self.db.read().get_tx_out(outpoint, Some(false))?;
         self.outpoints.put(*outpoint, tx_out.clone());
         Ok(tx_out)
@@ -289,14 +290,14 @@ impl BlockCache {
                 .ok_or(StoreError::NotFound(format!("block not found: {}", height)))?;
 
             for txid in &block.tx_ids {
-                let inputs = self.spent_outpoints.remove(&txid);
+                let inputs = self.spent_outpoints.remove(txid);
 
                 if let Some(inputs) = inputs {
                     for txin in inputs {
                         self.delete.script_pubkeys_outpoints.insert(txin.clone());
 
                         if !self.settings.index_spent_outputs {
-                            self.delete.tx_outs.insert(txin.previous_outpoint.clone());
+                            self.delete.tx_outs.insert(txin.previous_outpoint);
                         }
                     }
 
@@ -319,29 +320,33 @@ impl BlockCache {
                 .entry(script_pubkey.clone())
                 .or_default();
 
-            let tx_out = self.update.txouts.get(outpoint);
+            let Some(tx_out) = self.update.txouts.get(outpoint) else {
+                return Err(StoreError::NotFound(format!(
+                    "tx_out not found for script pubkey outpoint: {outpoint}"
+                )));
+            };
 
-            if let Some(tx_out) = tx_out {
-                if matches!(tx_out.spent, SpentStatus::Unspent) {
-                    entry.0.push(outpoint.clone());
-                } else {
-                    entry.1.push(outpoint.clone());
-                }
+            if matches!(tx_out.spent, SpentStatus::Unspent) {
+                entry.0.push(*outpoint);
             } else {
-                panic!("tx_out not found for outpoint: {}", outpoint);
+                entry.1.push(*outpoint);
             }
         }
 
         Ok(())
     }
 
+    /// Emits one `AddressModified` per script touched in the current update. Reads
+    /// `script_pubkeys_outpoints`, which is filled while indexing; `script_pubkeys` is only
+    /// built at flush time, after the events have been collected.
     pub fn add_address_events(&mut self, events: &mut Events, chain: Chain) {
-        for script_pubkey in self.update.script_pubkeys.keys() {
-            let address = chain.address_from_script(script_pubkey);
-            if let Ok(address) = address {
+        let scripts: HashSet<&ScriptBuf> = self.update.script_pubkeys_outpoints.values().collect();
+        let location = Location::block(self.get_block_height_tip());
+        for script_pubkey in scripts {
+            if let Ok(address) = chain.address_from_script(script_pubkey) {
                 events.add_event(Event::AddressModified {
                     address: address.to_string(),
-                    location: Location::block(self.get_block_height_tip()),
+                    location: location.clone(),
                 });
             }
         }
@@ -351,7 +356,8 @@ impl BlockCache {
         self.update.blocks.len() >= max_size
     }
 
-    pub fn flush(&mut self) -> Result<()> {
+    /// Move the current update into a batch for the background writer.
+    fn take_batch(&mut self) -> Result<Arc<BatchDB>> {
         info!(
             "Block cache: outpoints: {:?}, spent_outpoints: {:?}, blocks: {:?}",
             self.outpoints.len(),
@@ -374,53 +380,47 @@ impl BlockCache {
         let update = std::mem::replace(&mut self.update, new_update);
         let delete = std::mem::replace(&mut self.delete, BatchDelete::new());
 
-        let batch = Arc::new(BatchDB { update, delete });
-
-        self.bg_writer.save(batch);
-
         self.last_block_height = None;
         self.first_block_height = self.update.block_count;
 
+        Ok(Arc::new(BatchDB::new(update, delete)))
+    }
+
+    pub fn flush(&mut self) -> std::result::Result<(), UpdaterError> {
+        self.bg_writer.check()?;
+        let batch = self.take_batch()?;
+        self.bg_writer.save(batch)?;
         Ok(())
     }
 
     /// Flush all pending updates and block until they are fully persisted.
-    pub fn flush_sync(&mut self) -> Result<()> {
+    /// The caller must not hold a `StoreWithLock` guard.
+    pub fn flush_sync(&mut self) -> std::result::Result<(), UpdaterError> {
         // Perform the regular flush, which hands the batch off to the background writer.
         self.flush()?;
 
         // Wait for the background writer to drain the queue so that every update is
         // guaranteed to be visible via the persistent store.
-        self.bg_writer.wait_until_empty();
+        self.bg_writer.wait_until_empty()?;
 
         Ok(())
     }
 
-    /// Flush the current batch and return a receiver that signals when persistence completes.
-    pub fn flush_with_notify(&mut self) -> Result<crossbeam_channel::Receiver<()>> {
-        self.prepare_to_delete(self.settings.max_recoverable_reorg_depth)?;
+    /// Flush the current batch and return a receiver that fires once it is persisted.
+    /// The receiver disconnects without a message if the write fails.
+    pub fn flush_with_notify(
+        &mut self,
+    ) -> std::result::Result<crossbeam_channel::Receiver<()>, UpdaterError> {
+        self.bg_writer.check()?;
+        let batch = self.take_batch()?;
+        Ok(self.bg_writer.save_with_notify(batch)?)
+    }
 
-        if self.settings.index_addresses {
-            self.update_script_pubkeys()?;
-        }
-
-        let new_update = BatchUpdate::new(
-            self.update.rune_count,
-            self.update.block_count,
-            self.update.purged_blocks_count,
-        );
-
-        let update = std::mem::replace(&mut self.update, new_update);
-        let delete = std::mem::replace(&mut self.delete, BatchDelete::new());
-
-        let batch = Arc::new(BatchDB { update, delete });
-
-        let rx = self.bg_writer.save_with_notify(batch);
-
-        self.last_block_height = None;
-        self.first_block_height = self.update.block_count;
-
-        Ok(rx)
+    /// Wait until every flushed batch is persisted, stop the background writer and
+    /// report any failed write. Unflushed updates are discarded. The caller must not
+    /// hold a `StoreWithLock` guard.
+    pub fn close(mut self) -> std::result::Result<(), UpdaterError> {
+        Ok(self.bg_writer.close()?)
     }
 }
 
@@ -434,15 +434,15 @@ impl TransactionStore for BlockCache {
         for outpoint in outpoints {
             if let Some(tx_out) = self.outpoints.get(outpoint) {
                 tx_outs.insert(*outpoint, tx_out.clone());
+            } else if let Some(tx_out) = self.update.txouts.get(outpoint) {
+                tx_outs.insert(*outpoint, tx_out.clone());
+            } else if let Some(tx_out) = self
+                .bg_writer
+                .find_in_pending(|b| b.txouts.get(outpoint).cloned())
+            {
+                tx_outs.insert(*outpoint, tx_out);
             } else {
-                if let Some(tx_out) = self
-                    .bg_writer
-                    .find_in_pending(|b| b.txouts.get(outpoint).cloned())
-                {
-                    tx_outs.insert(*outpoint, tx_out);
-                } else {
-                    to_fetch.push(*outpoint);
-                }
+                to_fetch.push(*outpoint);
             }
         }
 
@@ -465,7 +465,7 @@ impl TransactionStore for BlockCache {
         if self.settings.index_addresses {
             self.update
                 .script_pubkeys_outpoints
-                .insert(outpoint.clone(), script_pubkey);
+                .insert(outpoint, script_pubkey);
         }
 
         self.outpoints.put(outpoint, tx_out.clone());
@@ -529,7 +529,7 @@ impl TransactionStore for BlockCache {
     fn get_transaction_confirming_block(&self, txid: &SerializedTxid) -> Result<BlockId> {
         // 1. Check current in-memory update.
         if let Some(block_id) = self.update.transaction_confirming_block.get(txid) {
-            return Ok(block_id.clone());
+            return Ok(*block_id);
         }
 
         // 2. Check pending batches.
@@ -541,7 +541,7 @@ impl TransactionStore for BlockCache {
         }
 
         // 3. Fallback to DB.
-        let block_id = self.db.read().get_transaction_confirming_block(&txid)?;
+        let block_id = self.db.read().get_transaction_confirming_block(txid)?;
         Ok(block_id)
     }
 
@@ -595,9 +595,10 @@ impl TransactionStore for BlockCache {
         }
 
         // 2. Pending batches.
-        if let Some(_) = self
+        if self
             .bg_writer
             .find_in_pending(|b| b.rune_ids.get(&rune.0).cloned())
+            .is_some()
         {
             return Ok(());
         }
@@ -617,6 +618,9 @@ impl TransactionStore for BlockCache {
     }
 
     fn set_rune(&mut self, id: RuneId, entry: RuneEntry) {
+        // Keep the read cache in step: once this update's batch is persisted and
+        // dropped from the pending list, `get_rune` falls through to `self.runes`.
+        self.runes.put(id, entry.clone());
         self.update.runes.insert(id, entry);
     }
 
@@ -652,5 +656,98 @@ impl TransactionStore for BlockCache {
             .entry(rune_id)
             .or_insert(vec![])
             .push(txid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::index::updater::testing::{rune_entry, TempStore},
+    };
+
+    fn settings() -> BlockCacheSettings {
+        BlockCacheSettings {
+            max_recoverable_reorg_depth: 10,
+            chain: Chain::Regtest,
+            max_async_batches: 2,
+            index_addresses: false,
+            index_spent_outputs: false,
+            rune_cache_size: 10,
+            outpoint_cache_size: 10,
+        }
+    }
+
+    #[test]
+    fn rune_reads_see_own_writes_after_flushes() {
+        let store = TempStore::new();
+        let id = RuneId::new(840_000, 1);
+        store.put_rune(id, &rune_entry(0, 0));
+
+        let mut cache = BlockCache::new(store.locked(), settings()).unwrap();
+
+        for mints in 1..=3 {
+            let mut entry = cache.get_rune(&id).unwrap();
+            assert_eq!(entry.mints, mints - 1);
+
+            entry.mints = mints;
+            cache.set_rune(id, entry);
+            // Persisted and dropped from the pending batches: the next read can only
+            // come from the read cache.
+            cache.flush_sync().unwrap();
+        }
+
+        assert_eq!(cache.get_rune(&id).unwrap().mints, 3);
+        cache.close().unwrap();
+        assert_eq!(store.db().get_rune(&id).unwrap().mints, 3);
+    }
+
+    #[test]
+    fn block_flush_keeps_pending_mints_stored_since_rune_was_read() {
+        let store = TempStore::new();
+        let id = RuneId::new(840_000, 1);
+        store.put_rune(id, &rune_entry(0, 0));
+
+        let mut cache = BlockCache::new(store.locked(), settings()).unwrap();
+        let mut entry = cache.get_rune(&id).unwrap();
+
+        // Mempool indexing records a pending mint after the block cache read the rune.
+        store.put_rune(id, &rune_entry(0, 1));
+
+        entry.mints = 1;
+        cache.set_rune(id, entry);
+        cache.flush_sync().unwrap();
+        cache.close().unwrap();
+
+        let stored = store.db().get_rune(&id).unwrap();
+        assert_eq!((stored.mints, stored.pending_mints), (1, 1));
+    }
+
+    #[test]
+    fn spends_find_outputs_evicted_from_the_read_cache() {
+        let store = TempStore::new();
+        let mut settings = settings();
+        settings.outpoint_cache_size = 1;
+        let mut cache = BlockCache::new(store.locked(), settings).unwrap();
+
+        let outpoints: Vec<SerializedOutPoint> = (0..2)
+            .map(|vout| SerializedOutPoint::from_txid_vout(&SerializedTxid::all_zeros(), vout))
+            .collect();
+
+        for outpoint in &outpoints {
+            let tx_out = TxOut {
+                runes: vec![],
+                risky_runes: vec![],
+                value: 1_000,
+                spent: SpentStatus::Unspent,
+                script_pubkey: ScriptBuf::new(),
+            };
+            cache.set_tx_out(*outpoint, tx_out, ScriptBuf::new());
+        }
+
+        // The first output was evicted from the one-entry read cache and was never
+        // flushed: only the current update has it.
+        assert_eq!(cache.get_tx_out(&outpoints[0]).unwrap().value, 1_000);
+        assert_eq!(cache.get_tx_outs(&outpoints).unwrap().len(), 2);
     }
 }

@@ -3,24 +3,12 @@
   "version": "0.0.8",
   "description": "Tests for Titan BTC indexer",
   "author": "Saturn BTC",
-  "publishConfig": {
-    "access": "public"
-  },
   "license": "MIT or Apache-2.0",
   "engines": {
     "node": ">=20.0.0"
   },
-  "files": [
-    "dist",
-    "package.json",
-    "README.md"
-  ],
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsup src/index.ts --format cjs,esm --dts",
-    "lint": "tsc --noEmit",
-    "deploy": "npm run build && npm publish"
+    "lint": "npm --prefix ../ts-sdk run build && tsc --noEmit"
   },
   "prettier": {
     "printWidth": 80,
@@ -40,11 +28,11 @@
     "axios": "^1.7.9"
   },
   "devDependencies": {
-    "@titanbtcio/sdk": "^0.0.11",
+    "@titanbtcio/sdk": "file:../ts-sdk",
     "@types/node": "^22.13.1",
     "bitcoinjs-lib": "^6.1.7",
     "prettier": "^3.4.2",
-    "tsup": "^8.3.6",
     "typescript": "^5.7.3"
-  }
+  },
+  "private": true
 }

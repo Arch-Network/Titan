@@ -6,6 +6,7 @@ pub use {
 };
 
 mod chain;
+#[allow(clippy::module_inception)] // renaming would churn every `index::index` path
 mod index;
 mod inscription;
 mod metrics;

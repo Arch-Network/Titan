@@ -10,15 +10,25 @@ export interface Status {
   mempool_tx_count: number;
 }
 
+/** Bitcoin block header, as serialized by the `bitcoin` crate. */
+export interface BlockHeader {
+  version: number;
+  prev_blockhash: string;
+  merkle_root: string;
+  time: number;
+  bits: number;
+  nonce: number;
+}
+
 export interface Block {
   height: number;
-  header: string;
+  header: BlockHeader;
   tx_ids: string[];
   etched_runes: string[];
 }
 
 export interface RuneAmount {
-  rune_id: string;
+  id: string;
   amount: string;
 }
 
@@ -43,6 +53,11 @@ export interface OutPoint {
   vout: number;
 }
 
+export interface InscriptionId {
+  txid: string;
+  index: number;
+}
+
 export interface AddressTxOut extends OutPoint {
   value: number;
   runes: RuneAmount[];
@@ -53,10 +68,12 @@ export interface AddressTxOut extends OutPoint {
   weight: number;
 }
 
+/** Balance summary of an address; page its outputs with `getAddressOutputs`. */
 export interface AddressData {
   value: number;
   runes: RuneAmount[];
-  outputs: AddressTxOut[];
+  /** Number of outputs counted in `value` / `runes`. */
+  output_count: number;
 }
 
 export interface TxOut {
@@ -122,7 +139,7 @@ export interface RuneResponse {
   mint: MintResponse | null;
   pending_burns: string;
   pending_mints: string;
-  inscription_id?: string;
+  inscription_id?: InscriptionId;
   timestamp: number;
   turbo: boolean;
 }
@@ -204,7 +221,7 @@ export type TitanEvent =
       data: {
         amount: string;
         location: Location;
-        outpoint: string;
+        outpoint: OutPoint;
         rune_id: string;
         txid: string;
       };
@@ -262,7 +279,7 @@ export interface TcpSubscriptionRequest {
 
 export interface MempoolEntryFee {
   base: number;
-  modified: number;
+  descendant: number;
   ancestor: number;
 }
 
@@ -276,4 +293,10 @@ export interface MempoolEntry {
   fees: MempoolEntryFee;
   depends: string[];
   spentby: string[];
+}
+
+/** One item of `GET /mempool/entries`. */
+export interface MempoolTxEntry {
+  txid: string;
+  entry: MempoolEntry;
 }

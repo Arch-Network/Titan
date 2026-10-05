@@ -1,25 +1,25 @@
 use {
     crate::{
         index::{
-            store::StoreError,
+            store::{Store, StoreError},
             updater::{events::Events, store_lock::StoreWithLock, transaction::TransactionStore},
             Chain, Settings,
         },
         models::{
-            BatchDelete, BatchUpdate, BlockId, Inscription, RuneEntry, TransactionStateChange,
+            BatchUpdate, BlockId, Inscription, RuneEntry, TransactionStateChange,
             TransactionStateChangeInput,
         },
     },
-    bitcoin::{consensus, ScriptBuf, Transaction},
-    rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet},
-    std::{sync::Arc, time::Instant},
     arch_titan_types_core::Rune,
     arch_titan_types_core::RuneId,
     arch_titan_types_core::{
         Event, InscriptionId, Location, MempoolEntry, SerializedOutPoint, SerializedTxid,
         SpenderReference, SpentStatus, TxOut,
     },
-    tracing::{debug, info},
+    bitcoin::{consensus, ScriptBuf, Transaction},
+    rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet},
+    std::{sync::Arc, time::Instant},
+    tracing::debug,
 };
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -41,6 +41,9 @@ impl MempoolCacheSettings {
 pub struct MempoolCache {
     db: Arc<StoreWithLock>,
     update: BatchUpdate,
+    /// Each rune entry as first read from the store, to compute this cache's own
+    /// change to the mempool-owned fields at flush.
+    rune_bases: HashMap<RuneId, RuneEntry>,
     pub settings: MempoolCacheSettings,
 }
 
@@ -64,6 +67,7 @@ impl MempoolCache {
         Ok(Self {
             db,
             update: BatchUpdate::new(rune_count, block_count, purged_blocks_count),
+            rune_bases: HashMap::default(),
             settings,
         })
     }
@@ -77,10 +81,10 @@ impl MempoolCache {
             return Ok(true);
         }
 
-        return self.db.read().is_tx_in_mempool(&txid);
+        self.db.read().is_tx_in_mempool(&txid)
     }
 
-    pub fn set_mempool_tx(&mut self, txid: SerializedTxid, mempool_entry: MempoolEntry) -> () {
+    pub fn set_mempool_tx(&mut self, txid: SerializedTxid, mempool_entry: MempoolEntry) {
         self.update.mempool_txs.insert(txid, mempool_entry);
     }
 
@@ -110,11 +114,15 @@ impl MempoolCache {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        let db = self.db.write();
+        // Hold the write lock from the rune re-read to the write (see `StoreWithLock`).
+        let store = self.db.clone();
+        let db = store.write();
 
         if self.settings.index_addresses {
             self.update_script_pubkeys()?;
         }
+
+        self.rebase_rune_entries(&**db)?;
 
         if !self.update.is_empty() {
             let start = Instant::now();
@@ -125,10 +133,61 @@ impl MempoolCache {
         Ok(())
     }
 
+    /// Mempool indexing owns only `pending_mints`/`pending_burns`. Re-read every
+    /// rune entry this cache changed and apply only its own change to those fields,
+    /// so `mints`/`burned` written by block indexing (and pending counts written by
+    /// other mempool writers) since the entry was read are kept.
+    fn rebase_rune_entries(&mut self, db: &dyn Store) -> Result<()> {
+        let rune_ids: Vec<RuneId> = self
+            .update
+            .runes
+            .keys()
+            .filter(|rune_id| self.rune_bases.contains_key(rune_id))
+            .copied()
+            .collect();
+
+        if rune_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut stored = db.get_runes_by_ids(&rune_ids)?;
+
+        for rune_id in rune_ids {
+            let entry = self.update.runes.remove(&rune_id).expect("rune in update");
+
+            // Gone from the store: a reorg reverted the etching. Don't resurrect it.
+            let Some(mut current) = stored.remove(&rune_id) else {
+                self.rune_bases.remove(&rune_id);
+                continue;
+            };
+
+            let base = &self.rune_bases[&rune_id];
+            current.pending_mints = apply_change(
+                current.pending_mints,
+                base.pending_mints,
+                entry.pending_mints,
+            );
+            current.pending_burns = apply_change(
+                current.pending_burns,
+                base.pending_burns,
+                entry.pending_burns,
+            );
+
+            // Writing `current` is now this cache's state: a second flush adds nothing.
+            self.rune_bases.insert(rune_id, current.clone());
+            self.update.runes.insert(rune_id, current);
+        }
+
+        Ok(())
+    }
+
+    /// Emits one `AddressModified` per script touched in the current update. Reads
+    /// `script_pubkeys_outpoints`, which is filled while indexing; `script_pubkeys` is only
+    /// built at flush time, after the events have been collected.
     pub fn add_address_events(&mut self, events: &mut Events, chain: Chain) {
-        for script_pubkey in self.update.script_pubkeys.keys() {
-            let address = chain.address_from_script(script_pubkey);
-            if let Ok(address) = address {
+        let scripts: HashSet<&ScriptBuf> = self.update.script_pubkeys_outpoints.values().collect();
+        for script_pubkey in scripts {
+            if let Ok(address) = chain.address_from_script(script_pubkey) {
                 events.add_event(Event::AddressModified {
                     address: address.to_string(),
                     location: Location::mempool(),
@@ -232,7 +291,7 @@ impl TransactionStore for MempoolCache {
     ) -> std::result::Result<BlockId, StoreError> {
         // 1. Check current in-memory update.
         if let Some(block_id) = self.update.transaction_confirming_block.get(txid) {
-            return Ok(block_id.clone());
+            return Ok(*block_id);
         }
 
         // 2. Fallback to DB.
@@ -252,12 +311,13 @@ impl TransactionStore for MempoolCache {
 
         // 2. DB.
         let rune = self.db.read().get_rune(rune_id)?;
+        self.rune_bases.insert(*rune_id, rune.clone());
         Ok(rune)
     }
 
     fn does_rune_exist(&mut self, rune: &Rune) -> std::result::Result<(), StoreError> {
         // 1. Current update.
-        if let Some(_) = self.update.rune_ids.get(&rune.0) {
+        if self.update.rune_ids.contains_key(&rune.0) {
             return Ok(());
         }
 
@@ -304,5 +364,51 @@ impl TransactionStore for MempoolCache {
             .entry(rune_id)
             .or_insert(vec![])
             .push(txid);
+    }
+}
+
+/// `current` moved by the difference between `new` and `base`.
+fn apply_change(current: u128, base: u128, new: u128) -> u128 {
+    if new >= base {
+        current.saturating_add(new - base)
+    } else {
+        current.saturating_sub(base - new)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::index::updater::testing::{rune_entry, TempStore},
+    };
+
+    #[test]
+    fn flush_keeps_mints_and_pending_mints_stored_since_rune_was_read() {
+        let store = TempStore::new();
+        let id = RuneId::new(840_000, 1);
+        store.put_rune(id, &rune_entry(0, 0));
+
+        let settings = MempoolCacheSettings {
+            chain: Chain::Regtest,
+            index_addresses: false,
+        };
+        let mut cache = MempoolCache::new(store.locked(), settings).unwrap();
+
+        let mut entry = cache.get_rune(&id).unwrap();
+        entry.pending_mints += 1;
+        cache.set_rune(id, entry);
+
+        // Meanwhile a block mints twice and another mempool writer adds a pending mint.
+        store.put_rune(id, &rune_entry(2, 1));
+
+        cache.flush().unwrap();
+        let stored = store.db().get_rune(&id).unwrap();
+        assert_eq!((stored.mints, stored.pending_mints), (2, 2));
+
+        // Flushing again adds nothing.
+        cache.flush().unwrap();
+        let stored = store.db().get_rune(&id).unwrap();
+        assert_eq!((stored.mints, stored.pending_mints), (2, 2));
     }
 }

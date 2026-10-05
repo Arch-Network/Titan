@@ -23,12 +23,7 @@ fn map_db_type<T>(
 
 impl<T: Entry> DBResultMapper<T> for DBResult<Option<Vec<u8>>> {
     fn mapped(self) -> DBResult<Option<T>> {
-        let func = |vec: &[u8]| -> DBResult<T> {
-            let val = T::load(vec.to_vec());
-            Ok(val)
-        };
-
-        map_db_type(self, &func)
+        map_db_type(self, &|vec: &[u8]| T::load(vec))
     }
 }
 
@@ -61,7 +56,7 @@ impl DBResultMapper<BlockHash> for DBResult<Option<Vec<u8>>> {
     fn mapped(self) -> DBResult<Option<BlockHash>> {
         let func = |vec: &[u8]| -> DBResult<BlockHash> {
             Ok(BlockHash::from_raw_hash(
-                Hash::from_slice(&vec).map_err(|_| RocksDBError::InvalidBlockHash)?,
+                Hash::from_slice(vec).map_err(|_| RocksDBError::InvalidBlockHash)?,
             ))
         };
 
@@ -71,8 +66,10 @@ impl DBResultMapper<BlockHash> for DBResult<Option<Vec<u8>>> {
 
 impl DBResultMapper<Transaction> for DBResult<Option<Vec<u8>>> {
     fn mapped(self) -> DBResult<Option<Transaction>> {
-        let func =
-            |vec: &[u8]| -> DBResult<Transaction> { Ok(consensus::deserialize(&vec).unwrap()) };
+        let func = |vec: &[u8]| -> DBResult<Transaction> {
+            consensus::deserialize(vec)
+                .map_err(|e| RocksDBError::Deserialize(format!("transaction: {e}")))
+        };
 
         map_db_type(self, &func)
     }

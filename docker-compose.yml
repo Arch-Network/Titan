@@ -15,29 +15,41 @@ services:
       - COMMIT_INTERVAL=${COMMIT_INTERVAL:-5}
       - BITCOIN_RPC_URL=http://bitcoind:${BITCOIN_RPC_PORT:-18443}
       - BITCOIN_RPC_USERNAME=${BITCOIN_RPC_USERNAME:-bitcoin}
-      - BITCOIN_RPC_PASSWORD=${BITCOIN_RPC_PASSWORD:-bitcoinpass}
+      - BITCOIN_RPC_PASSWORD=${BITCOIN_RPC_PASSWORD:?Set BITCOIN_RPC_PASSWORD in .env}
+      # Titan accepts bitcoind's chain names (main, test, testnet4, signet, regtest).
       - CHAIN=${BITCOIN_NETWORK:-regtest}
       - HTTP_LISTEN=0.0.0.0:${TITAN_HTTP_PORT:-3030}
       - TCP_ADDRESS=0.0.0.0:${TITAN_TCP_PORT:-8080}
+      - INDEX_ADDRESSES=${INDEX_ADDRESSES:-true}
+      - INDEX_BITCOIN_TRANSACTIONS=${INDEX_BITCOIN_TRANSACTIONS:-true}
+      - INDEX_SPENT_OUTPUTS=${INDEX_SPENT_OUTPUTS:-true}
+      - ENABLE_TCP_SUBSCRIPTIONS=${ENABLE_TCP_SUBSCRIPTIONS:-true}
+      - ENABLE_WEBHOOK_SUBSCRIPTIONS=${ENABLE_WEBHOOK_SUBSCRIPTIONS:-false}
+      # Passed through only when set; required when webhook subscriptions are enabled.
+      - WEBHOOK_ADMIN_TOKEN
+      # Set to true if webhook receivers are other compose services / private IPs.
+      - WEBHOOK_ALLOW_PRIVATE_ENDPOINTS=${WEBHOOK_ALLOW_PRIVATE_ENDPOINTS:-false}
     volumes:
       - "titan-data:/home/titan/data"
 
   bitcoind:
-    image: bitcoin/bitcoin
-    ports:
-      - 0.0.0.0:${BITCOIN_RPC_PORT:-18443}:${BITCOIN_RPC_PORT:-18443}
+    image: bitcoin/bitcoin:29.4
+    # RPC is reachable only from the compose network; it is intentionally not published.
     volumes:
       - "btcd-data:/var/lib/bitcoin-core"
     networks:
       titan-network:
         ipv4_address: 172.28.0.3
+    environment:
+      # The image entrypoint appends -datadir=$BITCOIN_DATA, so the data dir is set here.
+      - BITCOIN_DATA=/var/lib/bitcoin-core
     command: |
-      -${BITCOIN_NETWORK:-regtest}
-      -rpcallowip=0.0.0.0/0
-      -datadir=/var/lib/bitcoin-core
-      -rpcbind=bitcoind
+      -chain=${BITCOIN_NETWORK:-regtest}
+      -rpcport=${BITCOIN_RPC_PORT:-18443}
+      -rpcbind=0.0.0.0
+      -rpcallowip=172.28.0.0/24
       -rpcuser=${BITCOIN_RPC_USERNAME:-bitcoin}
-      -rpcpassword=${BITCOIN_RPC_PASSWORD:-bitcoinpass}
+      -rpcpassword=${BITCOIN_RPC_PASSWORD:?Set BITCOIN_RPC_PASSWORD in .env}
       -fallbackfee=0.00000001
       -txindex
     healthcheck:
@@ -45,16 +57,17 @@ services:
         [
           "CMD",
           "bitcoin-cli",
-          "-${BITCOIN_NETWORK:-regtest}",
-          "-rpcconnect=bitcoind",
+          "-chain=${BITCOIN_NETWORK:-regtest}",
+          "-rpcconnect=127.0.0.1",
           "-rpcport=${BITCOIN_RPC_PORT:-18443}",
           "-rpcuser=${BITCOIN_RPC_USERNAME:-bitcoin}",
-          "-rpcpassword=${BITCOIN_RPC_PASSWORD:-bitcoinpass}",
+          "-rpcpassword=${BITCOIN_RPC_PASSWORD:?Set BITCOIN_RPC_PASSWORD in .env}",
           "getblockchaininfo",
         ]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 5m
 
 networks:
   titan-network:

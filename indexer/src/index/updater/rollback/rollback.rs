@@ -4,12 +4,12 @@ use {
         index::{store::Store, Settings, StoreError},
         models::{TransactionStateChange, TransactionStateChangeInput},
     },
-    bitcoin::ScriptBuf,
+    arch_titan_types_core::RuneId,
+    arch_titan_types_core::{InscriptionId, SerializedOutPoint, SerializedTxid, SpentStatus},
+    bitcoin::{BlockHash, ScriptBuf},
     rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet},
     std::sync::Arc,
     thiserror::Error,
-    arch_titan_types_core::RuneId,
-    arch_titan_types_core::{InscriptionId, SerializedOutPoint, SerializedTxid, SpentStatus},
     tracing::{info, warn},
 };
 
@@ -39,6 +39,8 @@ pub struct Rollback<'a> {
     store: &'a Arc<dyn Store + Send + Sync>,
     settings: RollbackSettings,
     cache: RollbackCache<'a>,
+    /// Inputs whose recorded spender was a reverted transaction.
+    released_inputs: HashSet<SerializedOutPoint>,
 }
 
 impl<'a> Rollback<'a> {
@@ -52,10 +54,23 @@ impl<'a> Rollback<'a> {
             store,
             settings,
             cache,
+            released_inputs: HashSet::default(),
         })
     }
 
-    pub fn revert_transactions(&mut self, txids: &Vec<SerializedTxid>) -> Result<()> {
+    /// Revert the block at `height` and lower the block count to `height` in the
+    /// same write, so the stored block count never covers a half-reverted block.
+    pub fn revert_block(
+        &mut self,
+        height: u64,
+        block_hash: BlockHash,
+        txids: &[SerializedTxid],
+    ) -> Result<()> {
+        self.cache.delete_block(height, block_hash);
+        self.revert_transactions(txids)
+    }
+
+    pub fn revert_transactions(&mut self, txids: &[SerializedTxid]) -> Result<()> {
         let txs_state_changes = self
             .store
             .get_txs_state_changes(txids, self.cache.mempool)?;
@@ -75,7 +90,7 @@ impl<'a> Rollback<'a> {
             } else {
                 warn!("Transaction to rollback not found: {}", txid);
                 if self.cache.mempool {
-                    self.cache.add_tx_to_delete(txid.clone());
+                    self.cache.add_tx_to_delete(*txid);
                 }
             }
         }
@@ -113,7 +128,8 @@ impl<'a> Rollback<'a> {
         }
 
         self.cache.precache_tx_outs(&tx_outs)?;
-        self.cache.precache_runes(&runes.into_iter().collect())?;
+        self.cache
+            .precache_runes(&runes.into_iter().collect::<Vec<_>>())?;
 
         Ok(())
     }
@@ -125,7 +141,7 @@ impl<'a> Rollback<'a> {
     ) -> Result<()> {
         // Make spendable the inputs again.
         for tx_in in transaction.inputs.iter() {
-            self.update_spendable_input(&tx_in, SpentStatus::Unspent)?;
+            self.release_input(txid, tx_in)?;
         }
 
         // Remove tx_outs
@@ -145,7 +161,7 @@ impl<'a> Rollback<'a> {
                     self.cache.add_rune_to_delete(id);
                     self.cache.add_rune_id_to_delete(rune);
                     self.cache.add_inscription_to_delete(InscriptionId {
-                        txid: txid.clone(),
+                        txid: *txid,
                         index: 0,
                     });
 
@@ -173,31 +189,34 @@ impl<'a> Rollback<'a> {
         }
 
         // Finally remove the transaction.
-        self.cache.add_tx_to_delete(txid.clone());
+        self.cache.add_tx_to_delete(*txid);
 
         Ok(())
     }
 
-    fn update_spendable_input(
+    /// Mark the input's previous output unspent again, unless a different
+    /// transaction is recorded as its spender: with RBF the replacement may already
+    /// be indexed, and its spend must stay.
+    fn release_input(
         &mut self,
+        txid: &SerializedTxid,
         outpoint: &TransactionStateChangeInput,
-        spent: SpentStatus,
     ) -> Result<()> {
         match self.cache.get_tx_out(&outpoint.previous_outpoint) {
-            Ok(tx_out) => {
-                let mut tx_out = tx_out;
-                tx_out.spent = spent;
+            Ok(mut tx_out) => {
+                if matches!(&tx_out.spent, SpentStatus::Spent(spender) if spender.txid != *txid) {
+                    return Ok(());
+                }
+
+                tx_out.spent = SpentStatus::Unspent;
                 self.cache.set_tx_out(outpoint.previous_outpoint, tx_out);
-                Ok(())
             }
-            Err(StoreError::NotFound(_)) => {
-                // We don't need to do anything.
-                Ok(())
-            }
-            Err(e) => {
-                return Err(RollbackError::Store(e));
-            }
+            Err(StoreError::NotFound(_)) => {}
+            Err(e) => return Err(RollbackError::Store(e)),
         }
+
+        self.released_inputs.insert(outpoint.previous_outpoint);
+        Ok(())
     }
 
     fn decrement_mint(&mut self, rune_id: &RuneId) -> Result<()> {
@@ -213,7 +232,7 @@ impl<'a> Rollback<'a> {
                 rune_entry.mints = result;
             }
 
-            self.cache.set_rune(rune_id.clone(), rune_entry);
+            self.cache.set_rune(*rune_id, rune_entry);
         }
 
         Ok(())
@@ -238,7 +257,7 @@ impl<'a> Rollback<'a> {
                 rune_entry.burned = result;
             }
 
-            self.cache.set_rune(rune_id.clone(), rune_entry);
+            self.cache.set_rune(*rune_id, rune_entry);
         }
 
         Ok(())
@@ -281,11 +300,13 @@ impl<'a> Rollback<'a> {
         }
 
         if self.cache.mempool {
-            // Remove spent outpoints.
+            // Remove the spent-in-mempool markers of the inputs the reverted
+            // transactions were still the spenders of.
             let prev_outpoints = tx_to_state_changes
                 .values()
                 .filter(|tx| !tx.is_coinbase)
                 .flat_map(|tx| tx.inputs.iter().map(|input| input.previous_outpoint))
+                .filter(|outpoint| self.released_inputs.contains(outpoint))
                 .collect::<Vec<_>>();
 
             self.cache.add_prev_outpoint_to_delete(&prev_outpoints);
@@ -294,5 +315,107 @@ impl<'a> Rollback<'a> {
         self.cache.set_script_pubkey_entries(script_pubkey_entries);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{index::updater::testing::TempStore, models::BatchUpdate},
+        arch_titan_types_core::{SpenderReference, TxOut},
+    };
+
+    fn txid(n: u8) -> SerializedTxid {
+        SerializedTxid::from([n; 32])
+    }
+
+    fn tx_out(spent: SpentStatus) -> TxOut {
+        TxOut {
+            runes: vec![],
+            risky_runes: vec![],
+            value: 1_000,
+            spent,
+            script_pubkey: ScriptBuf::new(),
+        }
+    }
+
+    fn spending(outpoint: SerializedOutPoint) -> TransactionStateChange {
+        TransactionStateChange {
+            inputs: vec![TransactionStateChangeInput {
+                previous_outpoint: outpoint,
+                script_pubkey: None,
+            }],
+            outputs: vec![],
+            etched: None,
+            minted: None,
+            burned: HashMap::default(),
+            is_coinbase: false,
+        }
+    }
+
+    #[test]
+    fn mempool_revert_keeps_the_spend_of_an_rbf_replacement() {
+        let store = TempStore::new();
+        let db = store.shared();
+        let (replaced, replacement) = (txid(1), txid(2));
+        let outpoint = SerializedOutPoint::from_txid_vout(&txid(9), 0);
+        let spent_by_replacement = SpenderReference {
+            txid: replacement,
+            vin: 0,
+        };
+
+        // A confirmed output, spent in the mempool first by `replaced`, then by
+        // `replacement`, which is already indexed.
+        let mut confirmed = BatchUpdate::new(0, 0, 0);
+        confirmed
+            .txouts
+            .insert(outpoint, tx_out(SpentStatus::Unspent));
+        db.batch_update(&confirmed, false).unwrap();
+
+        let mut mempool = BatchUpdate::new(0, 0, 0);
+        mempool
+            .tx_state_changes
+            .insert(replaced, spending(outpoint));
+        mempool
+            .tx_state_changes
+            .insert(replacement, spending(outpoint));
+        mempool.txouts.insert(
+            outpoint,
+            tx_out(SpentStatus::Spent(spent_by_replacement.clone())),
+        );
+        mempool
+            .spent_outpoints_in_mempool
+            .insert(outpoint, spent_by_replacement.clone());
+        db.batch_update(&mempool, true).unwrap();
+
+        let revert = |txid: SerializedTxid| {
+            Rollback::new(
+                &db,
+                RollbackSettings {
+                    index_addresses: true,
+                },
+                true,
+            )
+            .unwrap()
+            .revert_transactions(&[txid])
+            .unwrap();
+        };
+
+        revert(replaced);
+        assert_eq!(
+            db.get_tx_out_with_mempool_spent_update(&outpoint, None)
+                .unwrap()
+                .spent,
+            SpentStatus::Spent(spent_by_replacement)
+        );
+
+        revert(replacement);
+        assert_eq!(
+            db.get_tx_out_with_mempool_spent_update(&outpoint, None)
+                .unwrap()
+                .spent,
+            SpentStatus::Unspent
+        );
     }
 }

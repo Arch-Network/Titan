@@ -94,25 +94,13 @@ export class TitanTcpClient extends EventEmitter {
    * @param subscriptionRequest The subscription request (e.g. { subscribe: ['RuneEtched', 'RuneMinted'] }).
    */
   subscribe(subscriptionRequest: TcpSubscriptionRequest): void {
-    // If we already have a live connection or are connecting, replace safely
-    if (this.socket || this.connecting) {
-      // Replace the stored request then restart connection cleanly
-      this.subscriptionRequest = subscriptionRequest;
-      // Forcefully close current socket to trigger reconnect logic
-      if (this.socket) {
-        this.socket.destroy(
-          new Error('Restarting subscription with new request'),
-        );
-      }
-      // If not autoReconnect, immediately connect with new request
-      if (!this.autoReconnect) {
-        this.connect();
-      }
-      return;
-    }
-
     this.subscriptionRequest = subscriptionRequest;
     this.shuttingDown = false;
+    // Tear down any existing connection synchronously (its listeners are
+    // detached, so its deferred 'close' cannot affect the new connection),
+    // then connect with the new request regardless of autoReconnect.
+    this.cleanup();
+    this.reconnectAttempt = 0;
     this.connect();
   }
 
@@ -134,27 +122,35 @@ export class TitanTcpClient extends EventEmitter {
     );
     this.connecting = true;
 
-    // Create a new TCP connection.
-    this.socket = net.createConnection(this.port, this.addr, () => {
+    // Create a new TCP connection. Every handler checks that it still belongs
+    // to the current socket so events from replaced sockets are ignored.
+    const socket = net.createConnection(this.port, this.addr, () => {
+      if (this.socket !== socket) return;
       // On connection, send the subscription request as JSON (terminated by newline).
       const reqJson = JSON.stringify(this.subscriptionRequest);
-      this.socket?.write(reqJson + '\n');
+      socket.write(reqJson + '\n');
       // Enable TCP keepalive
-      this.socket?.setKeepAlive(true, 30000);
+      socket.setKeepAlive(true, 30000);
       this.emit('reconnect'); // notify that a (re)connection has occurred.
       this.startHeartbeat();
-      this.reconnectAttempt = 0; // reset backoff
+      // Backoff is reset only once the session proves healthy (first event
+      // or PONG), so a server that accepts and immediately closes still
+      // backs off.
       this.updateStatus('Connected');
       this.connecting = false;
     });
+    this.socket = socket;
 
-    this.socket.on('error', (err) => {
+    socket.on('error', (err) => {
+      if (this.socket !== socket) return;
       this.emit('error', err);
     });
 
     // Set up a readline interface to handle incoming lines.
-    this.rl = readline.createInterface({ input: this.socket });
-    this.rl.on('line', (line: string) => {
+    const rl = readline.createInterface({ input: socket });
+    this.rl = rl;
+    rl.on('line', (line: string) => {
+      if (this.socket !== socket) return;
       try {
         const trimmed = line.trim();
         // Max line length protection (approximate by UTF-8 length)
@@ -167,7 +163,7 @@ export class TitanTcpClient extends EventEmitter {
             ),
           );
           // Force reconnect
-          this.socket?.destroy(new Error('Max line length exceeded'));
+          socket.destroy(new Error('Max line length exceeded'));
           return;
         }
         if (trimmed === 'PONG') {
@@ -176,16 +172,17 @@ export class TitanTcpClient extends EventEmitter {
           return;
         }
         const event = JSON.parse(line);
-        this.emit('event', event);
         // Receiving a valid event also proves liveness
         this.onPong();
+        this.emit('event', event);
       } catch (err) {
         this.emit('error', new Error(`Failed to parse event: ${line}`));
       }
     });
 
     // Handle connection closure.
-    this.socket.on('close', () => {
+    socket.on('close', () => {
+      if (this.socket !== socket) return;
       this.emit('close');
       this.cleanup();
       // If explicitly shut down, mark disconnected and exit
@@ -204,19 +201,25 @@ export class TitanTcpClient extends EventEmitter {
   }
 
   /**
-   * Cleans up the socket and readline interface.
+   * Cleans up the socket and readline interface. Listeners are detached so the
+   * old socket's deferred events cannot affect a subsequent connection.
    */
   private cleanup(): void {
     this.stopHeartbeat();
     this.clearReconnectTimer();
     this.connecting = false;
     if (this.rl) {
+      this.rl.removeAllListeners();
       this.rl.close();
       this.rl = null;
     }
     if (this.socket) {
-      this.socket.destroy();
+      const socket = this.socket;
       this.socket = null;
+      socket.removeAllListeners();
+      // Swallow late errors from the discarded socket.
+      socket.on('error', () => {});
+      socket.destroy();
     }
   }
 
@@ -225,7 +228,10 @@ export class TitanTcpClient extends EventEmitter {
    */
   shutdown(): void {
     this.shuttingDown = true;
+    const hadSocket = this.socket !== null;
     this.cleanup();
+    if (hadSocket) this.emit('close');
+    this.updateStatus('Disconnected');
   }
 
   /**
@@ -233,11 +239,11 @@ export class TitanTcpClient extends EventEmitter {
    */
   async shutdownAsync(): Promise<void> {
     if (this.shuttingDown) return;
-    this.shuttingDown = true;
-    const closed = this.waitForClose();
-    this.cleanup();
-    await closed;
-    this.updateStatus('Disconnected');
+    const socket = this.socket;
+    this.shutdown();
+    if (socket && !socket.closed) {
+      await new Promise<void>((resolve) => socket.once('close', () => resolve()));
+    }
   }
 
   private startHeartbeat(): void {
@@ -289,6 +295,8 @@ export class TitanTcpClient extends EventEmitter {
 
   private onPong(): void {
     this.awaitingPong = false;
+    // A PONG or event proves the session is healthy: reset backoff.
+    this.reconnectAttempt = 0;
     if (this.heartbeatTimeout) {
       clearTimeout(this.heartbeatTimeout);
       this.heartbeatTimeout = null;
@@ -324,17 +332,6 @@ export class TitanTcpClient extends EventEmitter {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-  }
-
-  private waitForClose(): Promise<void> {
-    if (!this.socket) return Promise.resolve();
-    return new Promise((resolve) => {
-      const onClose = () => {
-        this.off('close', onClose);
-        resolve();
-      };
-      this.on('close', onClose);
-    });
   }
 
   private updateStatus(next: ConnectionStatus): void {

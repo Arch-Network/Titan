@@ -1,15 +1,77 @@
 use {
     super::tcp_subscription::TcpSubscriptionManager,
     crate::subscription::WebhookSubscriptionManager,
-    chrono::{DateTime, Utc},
-    std::{fs::OpenOptions, io::Write, sync::Arc, time::SystemTime},
     arch_titan_types_core::Event,
+    chrono::{DateTime, Utc},
+    std::{
+        fs::OpenOptions,
+        io::{BufWriter, Write},
+        path::PathBuf,
+        sync::{
+            mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
+            Arc,
+        },
+        time::SystemTime,
+    },
     tokio::{
         select,
         sync::{mpsc, watch},
     },
-    tracing::{error, info},
+    tracing::{error, info, warn},
 };
+
+const EVENT_LOG_QUEUE: usize = 10_000;
+
+/// Appends events to a file on a dedicated thread so the async runtime never
+/// performs blocking file IO. Lines are dropped if the writer falls behind.
+pub struct EventLogger {
+    sender: SyncSender<String>,
+}
+
+impl EventLogger {
+    pub fn spawn(path: PathBuf) -> std::io::Result<Self> {
+        let (sender, receiver) = sync_channel(EVENT_LOG_QUEUE);
+        std::thread::Builder::new()
+            .name("titan-event-log".into())
+            .spawn(move || write_event_log(path, receiver))?;
+        Ok(Self { sender })
+    }
+
+    fn log(&self, event: &Event) {
+        match self.sender.try_send(format!("{:?}", event)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => warn!("Event log queue full, dropping event"),
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+fn write_event_log(path: PathBuf, receiver: Receiver<String>) {
+    let file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(e) => {
+            error!("Failed to open event log {}: {}", path.display(), e);
+            return;
+        }
+    };
+    let mut writer = BufWriter::new(file);
+
+    // Block for the next line, write it and everything else already queued, then flush.
+    while let Ok(first) = receiver.recv() {
+        let timestamp = DateTime::<Utc>::from(SystemTime::now())
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        let result = std::iter::once(first)
+            .chain(receiver.try_iter())
+            .try_for_each(|content| writeln!(writer, "[{:?}] {:?}", timestamp, content))
+            .and_then(|_| writer.flush());
+
+        if let Err(e) = result {
+            error!("Failed to write event log {}: {}", path.display(), e);
+        }
+    }
+}
 
 /// Asynchronously receive events from `receiver` and process them.
 /// If a shutdown signal arrives, exit gracefully.
@@ -18,7 +80,7 @@ pub async fn event_dispatcher(
     subscription_manager: Option<Arc<WebhookSubscriptionManager>>,
     tcp_subscription_manager: Option<Arc<TcpSubscriptionManager>>,
     mut shutdown_rx: watch::Receiver<()>,
-    enable_file_logging: bool,
+    event_logger: Option<EventLogger>,
 ) {
     info!("event_dispatcher started");
     loop {
@@ -26,14 +88,12 @@ pub async fn event_dispatcher(
             maybe_event = receiver.recv() => {
                 match maybe_event {
                     Some(event) => {
-                        // Process the event, e.g. dispatch to subscribed endpoints
+                        // Queue webhook deliveries (never blocks).
                         if let Some(manager) = &subscription_manager {
-                            if let Err(e) = manager.broadcast(&event).await {
-                                error!("Error processing event: {:?}", e);
-                            }
+                            manager.broadcast(&event);
                         }
 
-                        if enable_file_logging {
+                        if let Some(logger) = &event_logger {
                             if matches!(
                                 event,
                                 Event::TransactionsAdded { .. }
@@ -41,7 +101,7 @@ pub async fn event_dispatcher(
                                 | Event::NewBlock { .. }
                                 | Event::Reorg { .. }
                             ) {
-                                append_to_file("events.log", &format!("{:?}", event)).unwrap();
+                                logger.log(&event);
                             }
                         }
 
@@ -67,18 +127,4 @@ pub async fn event_dispatcher(
     }
 
     info!("event_dispatcher ended");
-}
-
-fn append_to_file(path: &str, content: &str) -> std::io::Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true) // Create the file if it doesn't exist
-        .append(true) // Open in append mode
-        .open(path)?;
-
-    let unix_timestamp = DateTime::<Utc>::from(SystemTime::now())
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
-
-    writeln!(file, "[{:?}] {:?}", unix_timestamp, content)?;
-    Ok(())
 }

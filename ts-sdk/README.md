@@ -171,7 +171,12 @@ testTcpSubscription();
   Retrieves a list of transaction IDs for a block.
 
 - **getAddress(address: string)**: `Promise<AddressData>`
-  Retrieves address data including balance and transaction outputs.
+  Retrieves an address's balance summary: `value`, `runes` and `output_count`.
+
+- **getAddressOutputs(address: string, pagination?: Pagination)**: `Promise<PaginationResponse<AddressTxOut>>`
+  Retrieves one page (at most 50) of the address's outputs: confirmed outputs in outpoint
+  order, then mempool-created ones; outputs spent in the mempool are left out. Pass the
+  returned `offset` as the next `skip`; an empty page means the end.
 
 - **getTransaction(txid: string)**: `Promise<Transaction>`
   Retrieves detailed information for a given transaction.
@@ -200,8 +205,8 @@ testTcpSubscription();
 - **getRuneTransactions(rune: string, pagination?: Pagination)**: `Promise<PaginationResponse<string>>`
   Retrieves a paginated list of transaction IDs involving a specific rune.
 
-- **getMempoolTxids()**: `Promise<string[]>`
-  Retrieves the transaction IDs currently in the mempool.
+- **getMempoolTxids(pagination?: Pagination)**: `Promise<PaginationResponse<string>>`
+  Retrieves one page (default and maximum 1000) of mempool txids, in txid byte order.
 
 - **getMempoolEntry(txid: string)**: `Promise<MempoolEntry>`
   Retrieves a specific mempool entry by its txid.
@@ -209,8 +214,12 @@ testTcpSubscription();
 - **getMempoolEntries(txids: string[])**: `Promise<Map<string, MempoolEntry>>`
   Retrieves multiple mempool entries by their txids.
 
-- **getAllMempoolEntries()**: `Promise<Map<string, MempoolEntry>>`
-  Retrieves all mempool entries.
+- **listMempoolEntries(pagination?: Pagination)**: `Promise<PaginationResponse<MempoolTxEntry>>`
+  Retrieves one page (at most 50) of `{ txid, entry }` mempool entries, in txid byte order.
+
+Webhook subscription methods require the server's admin token. Pass it when
+constructing the client: `new TitanHttpClient(url, { adminToken })`; it is
+sent as `Authorization: Bearer <token>`.
 
 - **getSubscription(id: string)**: `Promise<Subscription>`
   Retrieves a subscription by its ID.

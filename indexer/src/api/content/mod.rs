@@ -4,4 +4,5 @@ pub use {
 };
 
 mod accept_encoding;
+#[allow(clippy::module_inception)] // renaming would churn every `content::content` path
 mod content;

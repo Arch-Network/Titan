@@ -1,4 +1,5 @@
 use {
+    arch_titan_types_core::Rune,
     bitcoin::{address::FromScriptError, Address, Network, Script},
     clap::ValueEnum,
     serde::{Deserialize, Serialize},
@@ -7,7 +8,6 @@ use {
         str::FromStr,
     },
     thiserror::Error,
-    arch_titan_types_core::Rune,
 };
 
 #[derive(Error, Debug, Clone, PartialEq)]

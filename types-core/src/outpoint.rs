@@ -96,14 +96,14 @@ impl FromStr for SerializedOutPoint {
     type Err = std::io::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split(':').collect();
+        let invalid =
+            |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string());
+        let (txid, vout) = s
+            .split_once(':')
+            .ok_or_else(|| invalid("Invalid outpoint: expected <txid>:<vout>"))?;
         Ok(Self::from_txid_vout(
-            &SerializedTxid::from_str(parts[0]).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid txid")
-            })?,
-            parts[1].parse().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid vout")
-            })?,
+            &SerializedTxid::from_str(txid).map_err(|_| invalid("Invalid txid"))?,
+            vout.parse::<u32>().map_err(|_| invalid("Invalid vout"))?,
         ))
     }
 }
@@ -176,7 +176,7 @@ impl<'de> Deserialize<'de> for SerializedOutPoint {
             }
         }
 
-        const FIELDS: &'static [&'static str] = &["txid", "vout"];
+        const FIELDS: &[&str] = &["txid", "vout"];
         deserializer.deserialize_struct("SerializedOutPoint", FIELDS, SerializedOutPointVisitor)
     }
 }
@@ -184,6 +184,18 @@ impl<'de> Deserialize<'de> for SerializedOutPoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_from_str_rejects_malformed_outpoints() {
+        let txid = "0000000000000000000000000000000000000000000000000000000000000001";
+        assert!(SerializedOutPoint::from_str(txid).is_err());
+        assert!(SerializedOutPoint::from_str(&format!("{txid}:1:2")).is_err());
+        assert!(SerializedOutPoint::from_str(&format!("{txid}:")).is_err());
+        assert!(SerializedOutPoint::from_str(":1").is_err());
+        let op = SerializedOutPoint::from_str(&format!("{txid}:7")).unwrap();
+        assert_eq!(op.vout(), 7);
+        assert_eq!(op.to_txid().to_string(), txid);
+    }
     use bitcoin::{hashes::Hash, OutPoint};
     #[cfg(feature = "borsh")]
     use borsh::{BorshDeserialize, BorshSerialize};

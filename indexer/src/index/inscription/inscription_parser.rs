@@ -1,8 +1,8 @@
 use {
     super::*,
     crate::models::Inscription,
-    bitcoin::Transaction,
     arch_titan_types_core::{InscriptionId, SerializedTxid},
+    bitcoin::Transaction,
 };
 
 pub fn index_rune_icon(

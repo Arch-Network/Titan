@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 
 use crate::Error;
+use arch_titan_types_api::{
+    query, AddressData, AddressTxOut, BlockTip, MempoolTxEntry, Pagination, PaginationResponse,
+    RuneResponse, Status, Subscription,
+};
+use arch_titan_types_core::{
+    Block, InscriptionId, MempoolEntry, Transaction, TransactionStatus, TxOut,
+};
 use async_trait::async_trait;
 use bitcoin::{OutPoint, Txid};
 use reqwest::header::HeaderMap;
-use arch_titan_types_api::{
-    query, AddressData, BlockTip, Pagination, PaginationResponse, RuneResponse, Status,
-    Subscription,
-};
-use arch_titan_types_core::{Block, InscriptionId, MempoolEntry, Transaction, TransactionStatus, TxOut};
 
 /// Trait for all **async** methods.
 #[async_trait]
@@ -28,8 +30,16 @@ pub trait TitanApiAsync: Send + Sync + Clone + 'static {
     /// Returns a list of transaction IDs in a particular block.
     async fn get_block_txids(&self, query: &query::Block) -> Result<Vec<String>, Error>;
 
-    /// Fetches address data (balance, transactions, etc.).
+    /// Fetches an address's balance summary (value, runes and output count).
     async fn get_address(&self, address: &str) -> Result<AddressData, Error>;
+
+    /// Returns one page of an address's outputs. Follow `offset` as the next `skip`;
+    /// an empty page means the end. At most 50 per page.
+    async fn get_address_outputs(
+        &self,
+        address: &str,
+        pagination: Option<Pagination>,
+    ) -> Result<PaginationResponse<AddressTxOut>, Error>;
 
     /// Returns a higher-level transaction object (including Runes info) by `txid`.
     async fn get_transaction(&self, txid: &Txid) -> Result<Transaction, Error>;
@@ -71,8 +81,11 @@ pub trait TitanApiAsync: Send + Sync + Clone + 'static {
         pagination: Option<Pagination>,
     ) -> Result<PaginationResponse<Txid>, Error>;
 
-    /// Returns a list of all txids currently in the mempool.
-    async fn get_mempool_txids(&self) -> Result<Vec<Txid>, Error>;
+    /// Returns one page of mempool txids in txid byte order (at most 1000 per page).
+    async fn get_mempool_txids(
+        &self,
+        pagination: Option<Pagination>,
+    ) -> Result<PaginationResponse<Txid>, Error>;
 
     /// Returns a single mempool entry by `txid`.
     async fn get_mempool_entry(&self, txid: &Txid) -> Result<MempoolEntry, Error>;
@@ -83,8 +96,11 @@ pub trait TitanApiAsync: Send + Sync + Clone + 'static {
         txids: &[Txid],
     ) -> Result<HashMap<Txid, Option<MempoolEntry>>, Error>;
 
-    /// Returns all mempool entries.
-    async fn get_all_mempool_entries(&self) -> Result<HashMap<Txid, MempoolEntry>, Error>;
+    /// Returns one page of mempool entries in txid byte order (at most 50 per page).
+    async fn list_mempool_entries(
+        &self,
+        pagination: Option<Pagination>,
+    ) -> Result<PaginationResponse<MempoolTxEntry>, Error>;
 
     /// Returns the specified mempool entries along with all their ancestors.
     async fn get_mempool_entries_with_ancestors(
@@ -122,8 +138,15 @@ pub trait TitanApiSync: Send + Sync + Clone + 'static {
     /// Returns txids for a block in a **blocking** manner.
     fn get_block_txids(&self, query: &query::Block) -> Result<Vec<String>, Error>;
 
-    /// Returns address data in a **blocking** manner.
+    /// Returns an address's balance summary in a **blocking** manner.
     fn get_address(&self, address: &str) -> Result<AddressData, Error>;
+
+    /// Returns one page of an address's outputs in a **blocking** manner.
+    fn get_address_outputs(
+        &self,
+        address: &str,
+        pagination: Option<Pagination>,
+    ) -> Result<PaginationResponse<AddressTxOut>, Error>;
 
     /// Returns a transaction (with runic info) by `txid` in a **blocking** manner.
     fn get_transaction(&self, txid: &Txid) -> Result<Transaction, Error>;
@@ -165,8 +188,11 @@ pub trait TitanApiSync: Send + Sync + Clone + 'static {
         pagination: Option<Pagination>,
     ) -> Result<PaginationResponse<Txid>, Error>;
 
-    /// Returns mempool txids in a **blocking** manner.
-    fn get_mempool_txids(&self) -> Result<Vec<Txid>, Error>;
+    /// Returns one page of mempool txids in a **blocking** manner.
+    fn get_mempool_txids(
+        &self,
+        pagination: Option<Pagination>,
+    ) -> Result<PaginationResponse<Txid>, Error>;
 
     /// Returns a single mempool entry by `txid`.
     fn get_mempool_entry(&self, txid: &Txid) -> Result<MempoolEntry, Error>;
@@ -177,8 +203,11 @@ pub trait TitanApiSync: Send + Sync + Clone + 'static {
         txids: &[Txid],
     ) -> Result<HashMap<Txid, Option<MempoolEntry>>, Error>;
 
-    /// Returns all mempool entries.
-    fn get_all_mempool_entries(&self) -> Result<HashMap<Txid, MempoolEntry>, Error>;
+    /// Returns one page of mempool entries in a **blocking** manner.
+    fn list_mempool_entries(
+        &self,
+        pagination: Option<Pagination>,
+    ) -> Result<PaginationResponse<MempoolTxEntry>, Error>;
 
     /// Returns the specified mempool entries along with all their ancestors.
     fn get_mempool_entries_with_ancestors(

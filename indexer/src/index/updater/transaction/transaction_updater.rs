@@ -4,12 +4,12 @@ use {
         index::{inscription::index_rune_icon, Settings, StoreError},
         models::{BlockId, RuneEntry, TransactionStateChange, TransactionStateChangeInput},
     },
-    bitcoin::Transaction,
-    ordinals::{Artifact, Etching, Runestone},
-    thiserror::Error,
     arch_titan_types_core::RuneId,
     arch_titan_types_core::{Event, SerializedOutPoint, SerializedTxid, SpenderReference, TxOut},
     arch_titan_types_core::{Rune, SpacedRune},
+    bitcoin::Transaction,
+    ordinals::{Artifact, Etching, Runestone},
+    thiserror::Error,
     tokio::sync::mpsc::error::SendError,
 };
 
@@ -22,9 +22,15 @@ pub enum TransactionUpdaterError {
     #[error("store error {0}")]
     Store(#[from] StoreError),
     #[error("event sender error {0}")]
-    EventSender(#[from] SendError<Event>),
+    EventSender(#[from] Box<SendError<Event>>),
     #[error("overflow in {0}")]
     Overflow(String),
+}
+
+impl From<SendError<Event>> for TransactionUpdaterError {
+    fn from(error: SendError<Event>) -> Self {
+        Self::EventSender(Box::new(error))
+    }
 }
 
 type Result<T> = std::result::Result<T, TransactionUpdaterError>;
@@ -47,6 +53,15 @@ pub struct TransactionUpdater {
     pub(super) mempool: bool,
 }
 
+/// The transaction being saved and where it was confirmed (`block_id` is `None` in the mempool).
+#[derive(Clone, Copy)]
+pub struct TxContext<'a> {
+    pub block_time: u32,
+    pub block_id: Option<BlockId>,
+    pub txid: SerializedTxid,
+    pub transaction: &'a Transaction,
+}
+
 impl TransactionUpdater {
     pub fn new(settings: TransactionUpdaterSettings, mempool: bool) -> Result<Self> {
         Ok(Self { settings, mempool })
@@ -56,23 +71,18 @@ impl TransactionUpdater {
         &mut self,
         store: &mut dyn TransactionStore,
         events: &mut dyn TransactionEventMgr,
-        block_time: u32,
-        block_id: Option<BlockId>,
-        txid: SerializedTxid,
-        transaction: &Transaction,
+        tx: TxContext<'_>,
         transaction_state_change: &TransactionStateChange,
     ) -> Result<()> {
+        let TxContext {
+            block_id,
+            txid,
+            transaction,
+            ..
+        } = tx;
+
         if let Some((id, rune)) = transaction_state_change.etched {
-            self.etched_rune(
-                store,
-                events,
-                block_time,
-                block_id.as_ref().map(|id| id.height),
-                txid,
-                transaction,
-                &id,
-                rune,
-            )?;
+            self.etched_rune(store, events, tx, &id, rune)?;
         }
 
         // Update burned rune
@@ -162,14 +172,10 @@ impl TransactionUpdater {
         let previous_outpoint = outpoint.previous_outpoint;
         match store.set_spent_tx_out(outpoint, spent) {
             Ok(()) => Ok(()),
-            Err(StoreError::NotFound(_)) => {
-                return Err(TransactionUpdaterError::Store(StoreError::NotFound(
-                    format!("outpoint not found: {:?}", previous_outpoint),
-                )));
-            }
-            Err(e) => {
-                return Err(TransactionUpdaterError::Store(e));
-            }
+            Err(StoreError::NotFound(_)) => Err(TransactionUpdaterError::Store(
+                StoreError::NotFound(format!("outpoint not found: {:?}", previous_outpoint)),
+            )),
+            Err(e) => Err(TransactionUpdaterError::Store(e)),
         }
     }
 
@@ -187,7 +193,7 @@ impl TransactionUpdater {
         events.add_event(Event::RuneBurned {
             location: height.into(),
             txid,
-            amount: amount as u128,
+            amount,
             rune_id: *rune_id,
         });
 
@@ -208,7 +214,7 @@ impl TransactionUpdater {
         events.add_event(Event::RuneMinted {
             location: height.into(),
             txid,
-            amount: amount as u128,
+            amount,
             rune_id: *rune_id,
         });
 
@@ -264,15 +270,14 @@ impl TransactionUpdater {
         &mut self,
         store: &mut dyn TransactionStore,
         events: &mut dyn TransactionEventMgr,
-        block_time: u32,
-        height: Option<u64>,
-        txid: SerializedTxid,
-        transaction: &Transaction,
+        tx: TxContext<'_>,
         id: &RuneId,
         rune: Rune,
     ) -> Result<()> {
-        let artifact = Runestone::decipher(transaction).unwrap();
-        self.create_rune_entry(store, block_time, txid, transaction, *id, rune, &artifact)?;
+        let height = tx.block_id.map(|id| id.height);
+        let txid = tx.txid;
+        let artifact = Runestone::decipher(tx.transaction).unwrap();
+        self.create_rune_entry(store, tx, *id, rune, &artifact)?;
 
         events.add_event(Event::RuneEtched {
             location: height.into(),
@@ -286,13 +291,17 @@ impl TransactionUpdater {
     fn create_rune_entry(
         &mut self,
         store: &mut dyn TransactionStore,
-        block_time: u32,
-        txid: SerializedTxid,
-        transaction: &Transaction,
+        tx: TxContext<'_>,
         id: RuneId,
         rune: Rune,
         artifact: &Artifact,
     ) -> Result<()> {
+        let TxContext {
+            block_time,
+            txid,
+            transaction,
+            ..
+        } = tx;
         let inscription = index_rune_icon(transaction, txid);
 
         if let Some((id, inscription)) = inscription.as_ref() {

@@ -27,79 +27,12 @@ pub struct TransactionUpdate {
     block_added_counts: HashMap<SerializedTxid, u32>,
 }
 
-/// This struct is returned by `categorize()` to hold
-/// each distinct category of transaction transitions.
-#[derive(Debug, Default, Clone)]
-pub struct CategorizedTxs {
-    /// Transactions that were *both* in mempool_removed **and** in block_added.
-    /// Typically these were mined out of the mempool in the new block.
-    pub mined_from_mempool: HashSet<SerializedTxid>,
-
-    /// Transactions that were *both* block_removed **and** mempool_added.
-    /// Typically these were reorged out, but showed up again in mempool.
-    pub reorged_back_to_mempool: HashSet<SerializedTxid>,
-
-    /// Transactions that were *only* in mempool_added (and not block_removed, etc.).
-    /// These are newly seen in the mempool for the first time.
-    pub new_in_mempool_only: HashSet<SerializedTxid>,
-
-    /// Transactions that were *only* in block_added (and not mempool_removed),
-    /// i.e. we never saw them in mempool first.
-    pub new_block_only: HashSet<SerializedTxid>,
-
-    /// Transactions that were in block_removed but *not* re-mined
-    /// and *not* re‐added to mempool.  
-    /// (They have effectively “disappeared” from the best chain, and are not in mempool.)
-    pub reorged_out_entirely: HashSet<SerializedTxid>,
-
-    /// Transactions that were mempool_removed but *not* found in block_added,
-    /// so presumably RBF or evicted (or conflicted, or pruned).
-    pub mempool_rbf_or_evicted: HashSet<SerializedTxid>,
-
-    /// Transactions that appear in *both* `block_removed` and `block_added`.
-    /// That can happen in a reorg where a transaction was removed with the old block
-    /// but is also included in the new chain tip block. (Hence it never hits the mempool.)
-    pub reorged_out_and_remined: HashSet<SerializedTxid>,
-}
-
 pub struct TransactionChangeSet {
     pub removed: HashSet<SerializedTxid>,
     pub added: HashSet<SerializedTxid>,
 }
 
 impl TransactionUpdate {
-    pub fn new(mempool: TransactionChangeSet, block: TransactionChangeSet) -> Self {
-        let mut block_added_counts = HashMap::default();
-        for txid in &block.added {
-            block_added_counts.insert(*txid, 1);
-        }
-
-        let mut block_removed_counts = HashMap::default();
-        for txid in &block.removed {
-            block_removed_counts.insert(*txid, 1);
-        }
-
-        Self {
-            mempool_added: mempool.added,
-            mempool_removed: mempool.removed,
-            block_added: block.added,
-            block_removed: block.removed,
-            block_added_counts,
-            block_removed_counts,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.mempool_added.is_empty()
-            && self.mempool_removed.is_empty()
-            && self.block_added.is_empty()
-            && self.block_removed.is_empty()
-    }
-
-    pub fn enough_events_to_send(&self) -> bool {
-        self.block_added.len() > 10_000
-    }
-
     pub fn add_block_tx(&mut self, txid: SerializedTxid) {
         self.block_added.insert(txid);
         let entry = self.block_added_counts.entry(txid).or_insert(0);
@@ -124,72 +57,6 @@ impl TransactionUpdate {
         self.block_removed = HashSet::default();
         self.block_added_counts = HashMap::default();
         self.block_removed_counts = HashMap::default();
-    }
-
-    /// Categorize transactions into buckets describing what happened to them
-    /// across mempool and block changes.
-    pub fn categorize(&self) -> CategorizedTxs {
-        let mut result = CategorizedTxs::default();
-
-        // 1. Mined from mempool: present in both mempool_removed and block_added
-        for txid in self.mempool_removed.intersection(&self.block_added) {
-            result.mined_from_mempool.insert(*txid);
-        }
-
-        // 2. Reorged back to mempool: present in both block_removed and mempool_added
-        for txid in self.block_removed.intersection(&self.mempool_added) {
-            result.reorged_back_to_mempool.insert(*txid);
-        }
-
-        // 3. Newly in mempool only (i.e. in mempool_added but *not* also in block_removed)
-        //    and not in the intersection from #2
-        for txid in &self.mempool_added {
-            if !self.block_removed.contains(txid) {
-                result.new_in_mempool_only.insert(*txid);
-            }
-        }
-        // You might prefer a set-difference approach:
-        //   let new_in_mempool = &self.mempool_added - &self.block_removed;
-        //   result.new_in_mempool_only = new_in_mempool - &result.reorged_back_to_mempool;
-
-        // 4. New in block only (i.e. in block_added but not also in mempool_removed)
-        //    ignoring the intersection from #1
-        for txid in &self.block_added {
-            if !self.mempool_removed.contains(txid) {
-                result.new_block_only.insert(*txid);
-            }
-        }
-
-        // 5. Reorged out entirely:
-        //    in block_removed, but not reorged_back_to_mempool, not re-mined
-        //    So: block_removed ∖ (mempool_added ∪ block_added).
-        for txid in &self.block_removed {
-            let is_reorged_back = self.mempool_added.contains(txid);
-            let is_remined = self.block_added.contains(txid);
-            if !is_reorged_back && !is_remined {
-                result.reorged_out_entirely.insert(*txid);
-            }
-        }
-
-        // 6. Mempool RBF or eviction:
-        //    in mempool_removed, but *not* in block_added (so not mined).
-        //    This lumps all mempool removals that aren't a direct “mined” event.
-        //    Some of these might be genuine RBF replaced, some might be eviction, conflict, etc.
-        for txid in &self.mempool_removed {
-            if !self.block_added.contains(txid) {
-                result.mempool_rbf_or_evicted.insert(*txid);
-            }
-        }
-
-        // 7. Reorged out and re-mined:
-        //    in block_removed as well as block_added. That means it was removed
-        //    (the old block got replaced) but also added in the new chain tip block.
-        //    No time in mempool. It's fairly unusual but can happen.
-        for txid in self.block_removed.intersection(&self.block_added) {
-            result.reorged_out_and_remined.insert(*txid);
-        }
-
-        result
     }
 
     /// Categorize into exactly two “buckets”:
@@ -243,13 +110,6 @@ impl TransactionUpdate {
         }
     }
 
-    pub fn categorize_to_mempool(&self) -> TransactionChangeSet {
-        TransactionChangeSet {
-            added: self.mempool_added.clone(),
-            removed: self.mempool_removed.clone(),
-        }
-    }
-
     /// Detect txids that were reorged out and then re-mined within the same update,
     /// i.e., present in `block_removed` and added to `block_added` at least twice.
     pub fn block_added_after_mined_and_reorg(&self) -> HashSet<SerializedTxid> {
@@ -268,6 +128,48 @@ impl TransactionUpdate {
 }
 
 #[cfg(test)]
+impl TransactionUpdate {
+    pub fn new(mempool: TransactionChangeSet, block: TransactionChangeSet) -> Self {
+        let mut block_added_counts = HashMap::default();
+        for txid in &block.added {
+            block_added_counts.insert(*txid, 1);
+        }
+
+        let mut block_removed_counts = HashMap::default();
+        for txid in &block.removed {
+            block_removed_counts.insert(*txid, 1);
+        }
+
+        Self {
+            mempool_added: mempool.added,
+            mempool_removed: mempool.removed,
+            block_added: block.added,
+            block_removed: block.removed,
+            block_added_counts,
+            block_removed_counts,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mempool_added.is_empty()
+            && self.mempool_removed.is_empty()
+            && self.block_added.is_empty()
+            && self.block_removed.is_empty()
+    }
+
+    pub fn enough_events_to_send(&self) -> bool {
+        self.block_added.len() > 10_000
+    }
+
+    pub fn categorize_to_mempool(&self) -> TransactionChangeSet {
+        TransactionChangeSet {
+            added: self.mempool_added.clone(),
+            removed: self.mempool_removed.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rustc_hash::FxHashSet as HashSet;
@@ -278,7 +180,7 @@ mod tests {
     }
 
     fn set<const N: usize>(items: [SerializedTxid; N]) -> HashSet<SerializedTxid> {
-        HashSet::from_iter(items.into_iter())
+        HashSet::from_iter(items)
     }
 
     fn cs<A: IntoIterator<Item = SerializedTxid>, R: IntoIterator<Item = SerializedTxid>>(
@@ -294,10 +196,7 @@ mod tests {
     #[test]
     fn categorize_to_change_set_newly_added_in_mempool_only() {
         let a = tx(1);
-        let update = TransactionUpdate::new(
-            cs([a].into_iter(), [].into_iter()),
-            cs([].into_iter(), [].into_iter()),
-        );
+        let update = TransactionUpdate::new(cs([a], []), cs([], []));
 
         let out = update.categorize_to_change_set();
         assert_eq!(out.added, set([a]));
@@ -307,10 +206,7 @@ mod tests {
     #[test]
     fn categorize_to_change_set_newly_added_in_block_only() {
         let b = tx(2);
-        let update = TransactionUpdate::new(
-            cs([].into_iter(), [].into_iter()),
-            cs([b].into_iter(), [].into_iter()),
-        );
+        let update = TransactionUpdate::new(cs([], []), cs([b], []));
 
         let out = update.categorize_to_change_set();
         assert_eq!(out.added, set([b]));
@@ -321,8 +217,8 @@ mod tests {
     fn categorize_to_change_set_neither_if_mempool_removed_and_block_added() {
         let x = tx(3);
         let update = TransactionUpdate::new(
-            cs([].into_iter(), [x].into_iter()), // mempool_removed
-            cs([x].into_iter(), [].into_iter()), // block_added
+            cs([], [x]), // mempool_removed
+            cs([x], []), // block_added
         );
 
         let out = update.categorize_to_change_set();
@@ -334,8 +230,8 @@ mod tests {
     fn categorize_to_change_set_neither_if_block_removed_and_mempool_added() {
         let y = tx(4);
         let update = TransactionUpdate::new(
-            cs([y].into_iter(), [].into_iter()), // mempool_added
-            cs([].into_iter(), [y].into_iter()), // block_removed
+            cs([y], []), // mempool_added
+            cs([], [y]), // block_removed
         );
 
         let out = update.categorize_to_change_set();
@@ -347,8 +243,8 @@ mod tests {
     fn categorize_to_change_set_removed_if_block_removed_only() {
         let r = tx(5);
         let update = TransactionUpdate::new(
-            cs([].into_iter(), [].into_iter()),
-            cs([].into_iter(), [r].into_iter()), // block_removed
+            cs([], []),
+            cs([], [r]), // block_removed
         );
 
         let out = update.categorize_to_change_set();
@@ -360,8 +256,8 @@ mod tests {
     fn categorize_to_change_set_removed_if_mempool_removed_only() {
         let r = tx(6);
         let update = TransactionUpdate::new(
-            cs([].into_iter(), [r].into_iter()), // mempool_removed
-            cs([].into_iter(), [].into_iter()),
+            cs([], [r]), // mempool_removed
+            cs([], []),
         );
 
         let out = update.categorize_to_change_set();
@@ -374,10 +270,7 @@ mod tests {
     #[test]
     fn categorize_to_change_set_neither_if_block_removed_and_block_added_same_tx() {
         let t = tx(7);
-        let update = TransactionUpdate::new(
-            cs([].into_iter(), [].into_iter()),
-            cs([t].into_iter(), [t].into_iter()),
-        );
+        let update = TransactionUpdate::new(cs([], []), cs([t], [t]));
         let out = update.categorize_to_change_set();
         assert!(out.added.is_empty());
         assert!(out.removed.is_empty());
@@ -386,10 +279,7 @@ mod tests {
     #[test]
     fn categorize_to_change_set_neither_if_mempool_removed_and_added_same_tx() {
         let t = tx(8);
-        let update = TransactionUpdate::new(
-            cs([t].into_iter(), [t].into_iter()),
-            cs([].into_iter(), [].into_iter()),
-        );
+        let update = TransactionUpdate::new(cs([t], [t]), cs([], []));
         let out = update.categorize_to_change_set();
         assert!(out.added.is_empty());
         assert!(out.removed.is_empty());
@@ -404,10 +294,7 @@ mod tests {
         let e = tx(14); // block_removed only -> removed
         let f = tx(15); // mempool_removed only -> removed
 
-        let update = TransactionUpdate::new(
-            cs([a, d].into_iter(), [c, f].into_iter()),
-            cs([b, c].into_iter(), [d, e].into_iter()),
-        );
+        let update = TransactionUpdate::new(cs([a, d], [c, f]), cs([b, c], [d, e]));
         let out = update.categorize_to_change_set();
 
         assert_eq!(out.added, set([a, b]));
@@ -418,10 +305,7 @@ mod tests {
     fn helper_is_empty_and_reset() {
         let a = tx(21);
         let b = tx(22);
-        let mut update = TransactionUpdate::new(
-            cs([a].into_iter(), [].into_iter()),
-            cs([b].into_iter(), [].into_iter()),
-        );
+        let mut update = TransactionUpdate::new(cs([a], []), cs([b], []));
         assert!(!update.is_empty());
         update.reset();
         assert!(update.is_empty());
@@ -434,11 +318,8 @@ mod tests {
         let r1 = tx(33);
         let r2 = tx(34);
 
-        let mut update = TransactionUpdate::new(
-            cs([a1].into_iter(), [r1].into_iter()),
-            cs([].into_iter(), [].into_iter()),
-        );
-        update.update_mempool(cs([a2].into_iter(), [r2].into_iter()));
+        let mut update = TransactionUpdate::new(cs([a1], [r1]), cs([], []));
+        update.update_mempool(cs([a2], [r2]));
 
         let mem = update.categorize_to_mempool();
         assert_eq!(mem.added, set([a1, a2]));
@@ -452,10 +333,7 @@ mod tests {
         let ba = tx(43);
         let br = tx(44);
 
-        let update = TransactionUpdate::new(
-            cs([a].into_iter(), [r].into_iter()),
-            cs([ba].into_iter(), [br].into_iter()),
-        );
+        let update = TransactionUpdate::new(cs([a], [r]), cs([ba], [br]));
         let mem = update.categorize_to_mempool();
         assert_eq!(mem.added, set([a]));
         assert_eq!(mem.removed, set([r]));
@@ -486,10 +364,7 @@ mod tests {
         // Start with tx in a block, then reorged out twice and re-mined twice within the same update
         let t = tx(50);
 
-        let mut update = TransactionUpdate::new(
-            cs([t].into_iter(), [].into_iter()),
-            cs([].into_iter(), [].into_iter()),
-        );
+        let mut update = TransactionUpdate::new(cs([t], []), cs([], []));
 
         // Simulate two reorg outs
         update.remove_block_tx(t);
@@ -509,10 +384,7 @@ mod tests {
         let t = tx(51);
 
         // New tx added directly to a block
-        let mut update = TransactionUpdate::new(
-            cs([].into_iter(), [].into_iter()),
-            cs([t].into_iter(), [].into_iter()),
-        );
+        let mut update = TransactionUpdate::new(cs([], []), cs([t], []));
 
         // One reorg out
         update.remove_block_tx(t);
@@ -528,10 +400,7 @@ mod tests {
     #[test]
     fn no_event_if_reorged_once_and_not_remined() {
         let t = tx(52);
-        let mut update = TransactionUpdate::new(
-            cs([t].into_iter(), [].into_iter()),
-            cs([].into_iter(), [].into_iter()),
-        );
+        let mut update = TransactionUpdate::new(cs([t], []), cs([], []));
 
         // Reorg out once, not re-mined
         update.remove_block_tx(t);

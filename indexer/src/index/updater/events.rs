@@ -19,10 +19,10 @@ impl Events {
     pub fn send_events(
         &mut self,
         event_sender: &Option<mpsc::Sender<Event>>,
-    ) -> std::result::Result<(), mpsc::error::SendError<Event>> {
+    ) -> std::result::Result<(), Box<mpsc::error::SendError<Event>>> {
         if let Some(sender) = event_sender {
             for event in self.events.drain(..) {
-                sender.blocking_send(event)?;
+                sender.blocking_send(event).map_err(Box::new)?;
             }
         } else {
             self.events.clear();

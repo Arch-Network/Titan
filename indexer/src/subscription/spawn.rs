@@ -3,12 +3,14 @@ use {
     crate::{
         db::RocksDB,
         subscription::{
-            dispatcher::event_dispatcher, tcp_subscription::run_tcp_subscription_server,
-            webhook::cleanup_inactive_subscriptions,
+            dispatcher::{event_dispatcher, EventLogger},
+            tcp_subscription::run_tcp_subscription_server,
+            webhook::{cleanup_inactive_subscriptions, SubscriptionError},
         },
+        util::ServiceExitSender,
     },
-    std::{sync::Arc, time::Duration},
     arch_titan_types_core::Event,
+    std::{path::PathBuf, sync::Arc, time::Duration},
     tokio::{
         sync::{mpsc, watch},
         task,
@@ -42,16 +44,30 @@ pub struct SubscriptionConfig {
     pub enable_tcp_subscriptions: bool,
     pub tcp_address: String,
     pub enable_file_logging: bool,
+    pub events_log_path: PathBuf,
+    pub webhook_allow_private_endpoints: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SubscriptionSpawnError {
+    #[error("failed to bind TCP subscription server to {0}: {1}")]
+    TcpBind(String, std::io::Error),
+    #[error("failed to start webhook subscriptions: {0}")]
+    Webhook(#[from] SubscriptionError),
+    #[error("failed to start event log writer: {0}")]
+    EventLog(std::io::Error),
 }
 
 /// Spawns the subscription-related background tasks (dispatcher + cleanup).
+/// The TCP listener is bound before returning so bind failures abort startup.
 pub fn spawn_subscription_tasks(
     db: Arc<RocksDB>,
     config: SubscriptionConfig,
-) -> Option<SubscriptionSpawnResult> {
+    exit_tx: ServiceExitSender,
+) -> Result<Option<SubscriptionSpawnResult>, SubscriptionSpawnError> {
     // If both webhook and TCP subscriptions are disabled, return None
     if !config.enable_webhook_subscriptions && !config.enable_tcp_subscriptions {
-        return None;
+        return Ok(None);
     }
 
     // Create a watch channel for shutdown signaling
@@ -63,16 +79,25 @@ pub fn spawn_subscription_tasks(
         let tcp_subscription_manager_clone = tcp_subscription_manager.clone();
         let shutdown_rx_clone = shutdown_rx.clone();
 
+        let listener = std::net::TcpListener::bind(&config.tcp_address)
+            .and_then(|listener| {
+                listener.set_nonblocking(true)?;
+                tokio::net::TcpListener::from_std(listener)
+            })
+            .map_err(|e| SubscriptionSpawnError::TcpBind(config.tcp_address.clone(), e))?;
+        info!(
+            "TCP Subscription Server listening on {}",
+            config.tcp_address
+        );
+
         let tcp_server_handle = tokio::spawn(async move {
-            if let Err(e) = run_tcp_subscription_server(
-                &config.tcp_address,
+            run_tcp_subscription_server(
+                listener,
                 tcp_subscription_manager_clone,
                 shutdown_rx_clone,
             )
-            .await
-            {
-                error!("TCP subscription server error: {:?}", e);
-            }
+            .await;
+            let _ = exit_tx.send("TCP subscription server");
         });
 
         Some(TcpSubscriptionSpawnResult {
@@ -85,14 +110,17 @@ pub fn spawn_subscription_tasks(
 
     // Create the webhook subscription manager if enabled
     let webhook_spawn_result = if config.enable_webhook_subscriptions {
-        let webhook_subscription_manager = Arc::new(WebhookSubscriptionManager::new(db.clone()));
+        let webhook_subscription_manager = Arc::new(WebhookSubscriptionManager::new(
+            db.clone(),
+            config.webhook_allow_private_endpoints,
+        )?);
 
         let cleanup_rx = shutdown_rx.clone();
-        let cleanup_db = db.clone();
+        let cleanup_manager = webhook_subscription_manager.clone();
 
         let cleanup_handle = tokio::spawn(async move {
             cleanup_inactive_subscriptions(
-                cleanup_db,
+                cleanup_manager,
                 DEFAULT_CLEANUP_INTERVAL,
                 DEFAULT_CLEANUP_EXPIRY_SECS,
                 cleanup_rx,
@@ -122,26 +150,35 @@ pub fn spawn_subscription_tasks(
         .as_ref()
         .map(|r| r.tcp_subscription_manager.clone());
 
+    let event_logger = if config.enable_file_logging {
+        Some(
+            EventLogger::spawn(config.events_log_path.clone())
+                .map_err(SubscriptionSpawnError::EventLog)?,
+        )
+    } else {
+        None
+    };
+
     let dispatcher_handle = tokio::spawn(async move {
         event_dispatcher(
             event_receiver,
             webhook_manager_for_dispatcher,
             tcp_manager_for_dispatcher,
             dispatcher_rx,
-            config.enable_file_logging,
+            event_logger,
         )
         .await;
     });
 
     info!("Spawned subscription tasks (dispatcher + cleanup).");
 
-    Some(SubscriptionSpawnResult {
+    Ok(Some(SubscriptionSpawnResult {
         event_sender,
         dispatcher_handle,
         webhook_spawn_result,
         tcp_spawn_result,
         shutdown_tx,
-    })
+    }))
 }
 
 pub async fn shutdown_and_wait_subscription_tasks(spawn_result: SubscriptionSpawnResult) {
