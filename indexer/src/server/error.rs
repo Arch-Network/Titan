@@ -170,6 +170,9 @@ impl IntoResponse for ServerError {
                 error!("error serving request: {error}");
                 generic(StatusCode::BAD_GATEWAY)
             }
+            Self::ApiError(error @ ApiError::IndexNotReady) => {
+                plain(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+            }
             Self::RpcClientError(error) => {
                 error!("rpc client error: {error}");
                 generic(StatusCode::SERVICE_UNAVAILABLE)

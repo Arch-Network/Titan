@@ -1050,6 +1050,9 @@ impl RocksDB {
     /// `get_script_pubkey_outpoints(script, None)` returns: confirmed outputs in key order,
     /// then mempool-created ones, leaving out outputs spent in the mempool. Reads only the
     /// keys up to `skip + limit` (plus one spent-check chunk), not the whole set.
+    ///
+    /// A just-confirmed transaction's outputs stay in the mempool index until mempool
+    /// cleanup runs; those are returned once, as confirmed outputs.
     pub fn get_script_pubkey_outpoints_page(
         &self,
         script_pubkey: &ScriptBuf,
@@ -1064,10 +1067,13 @@ impl RocksDB {
         }
 
         let search_key = script_pubkey_search_key(script_pubkey);
+        let confirmed_cf = self.cf_handle(SCRIPT_PUBKEYS_CF)?;
         let mut to_skip = skip;
+        let mut keys = Vec::with_capacity(CHUNK);
         let mut chunk = Vec::with_capacity(CHUNK);
 
         for cf_name in [SCRIPT_PUBKEYS_CF, SCRIPT_PUBKEYS_MEMPOOL_CF] {
+            let is_mempool = cf_name == SCRIPT_PUBKEYS_MEMPOOL_CF;
             let cf_handle = self.cf_handle(cf_name)?;
             let mut iter = self.db.iterator_cf(
                 &cf_handle,
@@ -1076,6 +1082,7 @@ impl RocksDB {
 
             let mut exhausted = false;
             while !exhausted {
+                keys.clear();
                 chunk.clear();
                 while chunk.len() < CHUNK {
                     let Some(item) = iter.next() else {
@@ -1091,6 +1098,9 @@ impl RocksDB {
                         parse_outpoint_from_script_pubkey_key(&key, search_key.len())
                     {
                         chunk.push(outpoint);
+                        if is_mempool {
+                            keys.push(key);
+                        }
                     }
                 }
 
@@ -1098,8 +1108,18 @@ impl RocksDB {
                     break;
                 }
 
+                // Same key in the confirmed index: already listed in the confirmed pass.
+                let confirmed = if is_mempool {
+                    self.multi_get_values(&confirmed_cf, &keys)?
+                } else {
+                    Vec::new()
+                };
+
                 let spent = self.get_spent_outpoints_in_mempool(&chunk)?;
-                for outpoint in chunk.drain(..) {
+                for (i, outpoint) in chunk.drain(..).enumerate() {
+                    if confirmed.get(i).is_some_and(Option::is_some) {
+                        continue;
+                    }
                     if matches!(spent.get(&outpoint), Some(Some(_))) {
                         continue;
                     }

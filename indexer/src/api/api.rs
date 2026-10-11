@@ -44,6 +44,8 @@ pub enum ApiError {
         expected: bitcoin::Txid,
         returned: bitcoin::Txid,
     },
+    #[error("index has no blocks yet")]
+    IndexNotReady,
 }
 
 impl From<subscription::WebhookStoreError> for ApiError {
@@ -54,10 +56,17 @@ impl From<subscription::WebhookStoreError> for ApiError {
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
+/// Height and hash of the last indexed block, or `IndexNotReady` before the first.
+fn last_indexed_block(index: &Index) -> Result<(u64, BlockHash)> {
+    let height = index
+        .get_block_count()?
+        .checked_sub(1)
+        .ok_or(ApiError::IndexNotReady)?;
+    Ok((height, index.get_block_hash(height)?))
+}
+
 pub fn tip(index: Arc<Index>) -> Result<BlockTip> {
-    let block_count = index.get_block_count()?;
-    let height = block_count.saturating_sub(1);
-    let block_hash = index.get_block_hash(height)?;
+    let (height, block_hash) = last_indexed_block(&index)?;
     Ok(BlockTip {
         height,
         hash: block_hash.to_string(),
@@ -66,8 +75,7 @@ pub fn tip(index: Arc<Index>) -> Result<BlockTip> {
 }
 
 pub fn status(index: Arc<Index>) -> Result<Status> {
-    let height = index.get_block_count()?.saturating_sub(1);
-    let block_hash = index.get_block_hash(height)?;
+    let (height, block_hash) = last_indexed_block(&index)?;
     Ok(Status {
         block_tip: BlockTip {
             height,

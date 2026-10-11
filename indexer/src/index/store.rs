@@ -13,7 +13,7 @@ use {
         SpenderReference, SpentStatus, Transaction, TransactionStatus, TxOut,
     },
     bitcoin::{consensus, hex::HexToArrayError, BlockHash, ScriptBuf},
-    rustc_hash::FxHashMap as HashMap,
+    rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet},
     thiserror::Error,
 };
 
@@ -610,7 +610,14 @@ impl Store for RocksDB {
             let mut ledger_entry = self.get_script_pubkey_outpoints(script_pubkey, false)?;
             let mempool_entry = self.get_script_pubkey_outpoints(script_pubkey, true)?;
 
-            ledger_entry.extend(mempool_entry);
+            // A just-confirmed transaction's outputs stay in the mempool index until
+            // mempool cleanup runs; list them once, as confirmed.
+            let confirmed: HashSet<SerializedOutPoint> = ledger_entry.iter().copied().collect();
+            ledger_entry.extend(
+                mempool_entry
+                    .into_iter()
+                    .filter(|outpoint| !confirmed.contains(outpoint)),
+            );
 
             // Get spent outpoints in mempool.
             let spent_outpoints = self.get_spent_outpoints_in_mempool(&ledger_entry)?;
@@ -830,6 +837,47 @@ mod tests {
         .unwrap();
         assert_eq!(page.items, expected[295..300]);
         assert_eq!(page.offset, 300);
+    }
+
+    #[test]
+    fn address_outpoints_in_both_indexes_are_listed_once() {
+        let db = TempDb::new();
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+
+        let mut confirmed = BatchUpdate::new(0, 0, 0);
+        confirmed
+            .script_pubkeys
+            .insert(script.clone(), ((0..5).map(outpoint).collect(), vec![]));
+        db.batch_update(&confirmed, false).unwrap();
+
+        // 1..3 just confirmed but not yet removed from the mempool index.
+        let mut mempool = BatchUpdate::new(0, 0, 0);
+        mempool.script_pubkeys.insert(
+            script.clone(),
+            ([1, 2, 3, 100, 101].map(outpoint).to_vec(), vec![]),
+        );
+        db.batch_update(&mempool, true).unwrap();
+
+        // Confirmed outputs in key order, then the mempool-only ones.
+        let mut expected = Store::get_script_pubkey_outpoints(&*db, &script, Some(false)).unwrap();
+        assert_eq!(expected.len(), 5);
+        expected.extend(
+            Store::get_script_pubkey_outpoints(&*db, &script, Some(true))
+                .unwrap()
+                .into_iter()
+                .filter(|op| [outpoint(100), outpoint(101)].contains(op)),
+        );
+        assert_eq!(expected.len(), 7);
+        assert_eq!(
+            Store::get_script_pubkey_outpoints(&*db, &script, None).unwrap(),
+            expected
+        );
+        for limit in [1, 2, 3, 50] {
+            let paged = all_pages(limit, |pagination| {
+                Store::get_script_pubkey_outpoints_page(&*db, &script, pagination).unwrap()
+            });
+            assert_eq!(paged, expected, "limit {limit}");
+        }
     }
 
     #[test]

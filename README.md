@@ -83,10 +83,12 @@ disable it.
 When `--enable-webhook-subscriptions` is set, Titan refuses to start without
 `--webhook-admin-token` (or `WEBHOOK_ADMIN_TOKEN`). Every webhook subscription route
 (`GET /subscriptions`, `POST /subscription`, `GET`/`DELETE /subscription/{id}`) then requires
-`Authorization: Bearer <token>` and returns `401` otherwise. Webhook URLs that resolve to
-loopback, private or link-local addresses are rejected unless
-`--webhook-allow-private-endpoints` is set (needed when receivers run in the same compose
-network):
+`Authorization: Bearer <token>` and returns `401` otherwise. Webhook URLs must be `http`/`https`,
+at most 2048 bytes and free of embedded credentials. URLs that resolve to anything but a public
+unicast address (loopback, private, link-local, CGNAT, NAT64, 6to4, Teredo, ...) are rejected
+unless `--webhook-allow-private-endpoints` is set (needed when receivers run in the same compose
+network). Deliveries are retried with exponential backoff on network errors, `408`, `425`, `429`
+and `5xx`; any other non-2xx response fails the delivery immediately:
 
 ```bash
 curl -H "Authorization: Bearer $WEBHOOK_ADMIN_TOKEN" http://localhost:3030/subscriptions
