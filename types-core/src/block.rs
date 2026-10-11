@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn test_empty_block_serialization_roundtrip() {
         let header = create_test_header();
-        let block = Block::empty_block(12345, header.clone());
+        let block = Block::empty_block(12345, header);
 
         // Serialize
         let serialized = borsh::to_vec(&block).expect("Failed to serialize empty block");
@@ -205,7 +205,7 @@ mod tests {
 
         let block = Block {
             height: 67890,
-            header: header.clone(),
+            header,
             tx_ids: tx_ids.clone(),
             etched_runes: etched_runes.clone(),
         };
@@ -232,7 +232,7 @@ mod tests {
 
         let block = Block {
             height: 1,
-            header: header.clone(),
+            header,
             tx_ids: tx_ids.clone(),
             etched_runes: vec![],
         };
@@ -256,7 +256,7 @@ mod tests {
 
         let block = Block {
             height: 2,
-            header: header.clone(),
+            header,
             tx_ids: vec![],
             etched_runes: etched_runes.clone(),
         };
@@ -288,7 +288,7 @@ mod tests {
 
         let block = Block {
             height: u64::MAX,
-            header: header.clone(),
+            header,
             tx_ids: vec![SerializedTxid::all_zeros()],
             etched_runes: vec![RuneId::new(u64::MAX, u32::MAX)],
         };
@@ -326,7 +326,7 @@ mod tests {
 
         let block = Block {
             height: 500000,
-            header: header.clone(),
+            header,
             tx_ids: large_tx_ids.clone(),
             etched_runes: large_etched_runes.clone(),
         };
@@ -354,7 +354,7 @@ mod tests {
         let header = create_test_header();
         let block = Block {
             height: 123456,
-            header: header.clone(),
+            header,
             tx_ids: create_test_txids(),
             etched_runes: create_test_rune_ids(),
         };
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn test_header_fields_preservation() {
         // Test various header configurations to ensure all fields are preserved
-        let headers = vec![
+        let headers = [
             Header {
                 version: Version::from_consensus(1),
                 prev_blockhash: BlockHash::from_raw_hash(Hash::from_slice(&[1u8; 32]).unwrap()),
@@ -414,10 +414,10 @@ mod tests {
                 etched_runes: vec![],
             };
 
-            let serialized =
-                borsh::to_vec(&block).expect(&format!("Failed to serialize header test {}", i));
+            let serialized = borsh::to_vec(&block)
+                .unwrap_or_else(|_| panic!("Failed to serialize header test {}", i));
             let deserialized = Block::try_from_slice(&serialized)
-                .expect(&format!("Failed to deserialize header test {}", i));
+                .unwrap_or_else(|_| panic!("Failed to deserialize header test {}", i));
 
             assert_eq!(block.header.version, deserialized.header.version);
             assert_eq!(

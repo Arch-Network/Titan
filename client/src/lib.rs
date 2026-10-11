@@ -4,14 +4,14 @@ mod tcp;
 
 pub use error::*;
 
+pub use arch_titan_types_api::*;
+pub use arch_titan_types_core::*;
 pub use http::{
     AsyncClient as TitanClient, SyncClient as TitanBlockingClient, TitanApiAsync as TitanApi,
     TitanApiSync as TitanApiBlocking,
 };
 pub use tcp::{ConnectionStatus, ConnectionStatusTracker};
 pub use tcp::{ReconnectionConfig, ReconnectionManager};
-pub use arch_titan_types_api::*;
-pub use arch_titan_types_core::*;
 
 #[cfg(feature = "tcp_client")]
 pub use tcp::{TitanTcpClient, TitanTcpClientConfig, TitanTcpClientError};
@@ -22,8 +22,10 @@ pub use tcp::{TitanTcpClientBlocking, TitanTcpClientBlockingConfig, TitanTcpClie
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::error::Error;
+    #[cfg(feature = "tcp_client")]
     use arch_titan_types_api::TcpSubscriptionRequest;
+    use std::error::Error;
+    #[cfg(feature = "tcp_client")]
     use tokio::time::{Duration, Instant};
 
     // Import the HTTP and TCP client functions.

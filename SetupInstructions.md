@@ -25,6 +25,14 @@ After installation, source the environment script to make cargo available in you
 source $HOME/.cargo/env
 ```
 
+Install the toolchain used by CI and the Docker image (Rust 1.94.0):
+
+***Command:***
+```bash
+rustup toolchain install 1.94.0
+rustup default 1.94.0
+```
+
 Verify Installation:
 
 ***Command:***
@@ -32,6 +40,10 @@ Verify Installation:
 rustc --version
 cargo --version
 ```
+
+Building Titan also compiles RocksDB from source, which needs a C/C++ compiler and `libclang`
+(e.g. `sudo apt-get install build-essential clang libclang-dev pkg-config libssl-dev` on
+Debian/Ubuntu; on macOS the Xcode command line tools are enough).
 
 ## Bitcoin Node 27.0
 
@@ -120,7 +132,7 @@ server=1
 [regtest]
 rpcuser=<USERNAME>
 rpcpassword=<PASSWORD>
-rpcport=18444
+rpcport=18443
 daemon=1
 ```
 
@@ -273,17 +285,27 @@ git clone https://github.com/Arch-Network/Titan.git
 ```bash
 mkdir -p ~/titan-indexer
 ```
-No need to create .env file in titan indexer project
+No need to create a .env file in the Titan project (it is only used by docker compose).
 
 
-### Run like this: (Just cli flags)
+### Run
+
+Every flag can also be set through an environment variable of the same name in UPPER_SNAKE
+case (`--bitcoin-rpc-password` ↔ `BITCOIN_RPC_PASSWORD`). Pass the password through the
+environment so it does not show up in the process list. See the options table in
+[README.md](./README.md) for all flags; boolean flags accept `=false` (e.g.
+`--index-spent-outputs=false`).
 
 ***Command:***
 ```bash
-cd titan
+cd Titan
 
-cargo run -p titan -- --bitcoin-rpc-url http://localhost:18444 --bitcoin-rpc-username <USERNAME> --bitcoin-rpc-password <PASSWORD> --chain regtest --index-addresses --index-bitcoin-transactions --enable-tcp-subscriptions --data-dir ~/titan-indexer
+export BITCOIN_RPC_PASSWORD=<PASSWORD>
+cargo run --release -p titan -- --bitcoin-rpc-url http://localhost:18443 --bitcoin-rpc-username <USERNAME> --chain regtest --index-addresses --enable-tcp-subscriptions --data-dir ~/titan-indexer
 ```
+
+If `--data-dir` holds an index created by a Titan release older than index schema v2, Titan
+exits with a schema mismatch error: delete the directory and let Titan re-index.
 
 ***Output:***
 ```bash

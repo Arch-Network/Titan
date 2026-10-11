@@ -19,6 +19,7 @@ pub struct ServerConfig {
 
     pub(crate) index_addresses: bool,
     pub(crate) enable_webhook_subscriptions: bool,
+    pub(crate) webhook_admin_token: Option<String>,
 }
 
 impl RpcClientProvider for ServerConfig {

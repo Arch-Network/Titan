@@ -1,6 +1,6 @@
 use {
     crate::bitcoin_rpc::{BitcoinCoreRpcResultExt, RpcClientPool},
-    bitcoin::{Block, BlockHash},
+    bitcoin::Block,
     bitcoincore_rpc::{Client, RpcApi},
     std::{
         collections::BTreeMap,
@@ -16,30 +16,51 @@ use {
 };
 
 /// Simple counting semaphore for synchronizing buffer capacity between producer and consumer threads.
+///
+/// The semaphore can be closed, which wakes every waiter and makes all current and future
+/// `acquire` calls fail. This is used to release producers once the consumer side of a fetch is
+/// gone, so no worker stays blocked after the fetch ends.
 #[derive(Clone, Debug)]
 struct Semaphore {
-    inner: Arc<(Mutex<usize>, Condvar)>,
+    inner: Arc<(Mutex<SemaphoreState>, Condvar)>,
+}
+
+#[derive(Debug)]
+struct SemaphoreState {
+    permits: usize,
+    closed: bool,
 }
 
 impl Semaphore {
     /// Create a new semaphore that allows `permits` concurrent acquisitions.
     fn new(permits: usize) -> Self {
         Self {
-            inner: Arc::new((Mutex::new(permits), Condvar::new())),
+            inner: Arc::new((
+                Mutex::new(SemaphoreState {
+                    permits,
+                    closed: false,
+                }),
+                Condvar::new(),
+            )),
         }
     }
 
     /// Block the current thread until a permit can be acquired.
-    fn acquire(&self) {
+    ///
+    /// Returns `false` without acquiring a permit if the semaphore is (or gets) closed.
+    fn acquire(&self) -> bool {
         let (mutex, cvar) = &*self.inner;
         // Enter standard Condvar pattern: guard + loop on predicate.
-        let mut remaining = mutex.lock().expect("Semaphore mutex poisoned");
+        let mut state = mutex.lock().expect("Semaphore mutex poisoned");
         loop {
-            if *remaining > 0 {
-                *remaining -= 1;
-                return;
+            if state.closed {
+                return false;
             }
-            remaining = match cvar.wait(remaining) {
+            if state.permits > 0 {
+                state.permits -= 1;
+                return true;
+            }
+            state = match cvar.wait(state) {
                 Ok(guard) => guard, // spurious wake-up or notify()
                 Err(poison) => panic!("Semaphore condvar poisoned: {poison}"),
             };
@@ -49,9 +70,36 @@ impl Semaphore {
     /// Release a previously-acquired permit, unblocking one waiting thread if any.
     fn release(&self) {
         let (mutex, cvar) = &*self.inner;
-        let mut remaining = mutex.lock().expect("Semaphore mutex poisoned");
-        *remaining += 1;
+        let mut state = mutex.lock().expect("Semaphore mutex poisoned");
+        state.permits += 1;
         cvar.notify_one();
+    }
+
+    /// Close the semaphore, waking every waiter. All subsequent `acquire` calls fail.
+    fn close(&self) {
+        let (mutex, cvar) = &*self.inner;
+        let mut state = mutex.lock().expect("Semaphore mutex poisoned");
+        state.closed = true;
+        cvar.notify_all();
+    }
+
+    fn is_closed(&self) -> bool {
+        let (mutex, _) = &*self.inner;
+        mutex.lock().expect("Semaphore mutex poisoned").closed
+    }
+}
+
+/// Owned by the reorder thread; dropping it marks the fetch as finished. It closes the buffer
+/// semaphore (unblocking and cancelling pending fetch jobs) and disconnects the stats logging
+/// thread, so no helper thread outlives the fetch.
+struct FetchDoneGuard {
+    buffer_semaphore: Semaphore,
+    _stop_logging: mpsc::Sender<()>,
+}
+
+impl Drop for FetchDoneGuard {
+    fn drop(&mut self) {
+        self.buffer_semaphore.close();
     }
 }
 
@@ -145,7 +193,6 @@ impl BlockFetcherStats {
 
 pub enum BlockLocator {
     Height(u64),
-    Hash(BlockHash),
 }
 
 pub fn fetch_blocks_from(
@@ -173,13 +220,20 @@ pub fn fetch_blocks_from_with_buffer_limit(
     // Intermediate channel for unordered (height, block) tuples.
     let (intermediate_sender, intermediate_receiver) = mpsc::sync_channel(1000);
 
-    // Spawn a logging thread to report stats every second. Automatically stops when `shutdown_flag` is set.
+    // Disconnected when the reorder thread (and thus this fetch) finishes.
+    let (stop_logging_tx, stop_logging_rx) = mpsc::channel::<()>();
+
+    // Spawn a logging thread to report stats every second. Stops when this fetch finishes or
+    // `shutdown_flag` is set.
     thread::spawn({
         let stats = stats.clone();
         let shutdown_flag = shutdown_flag.clone();
         move || {
             while !shutdown_flag.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_secs(1));
+                match stop_logging_rx.recv_timeout(Duration::from_secs(1)) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
                 let (fetching, intermediate, final_count, buffer) = stats.snapshot();
                 tracing::debug!(
                     "Block fetcher stats - Fetching: {}, Intermediate: {}, Final: {}, Buffer: {}",
@@ -189,17 +243,23 @@ pub fn fetch_blocks_from_with_buffer_limit(
                     buffer
                 );
             }
-            tracing::debug!("Block fetcher logging thread terminating due to shutdown signal");
+            trace!("Block fetcher logging thread terminating");
         }
     });
 
     // Spawn a thread to reorder blocks. Terminates when `shutdown_flag` is set or channels close.
+    // Its exit marks the end of the fetch (see `FetchDoneGuard`).
     thread::spawn({
         let final_sender = final_sender.clone();
         let stats = stats.clone();
         let buffer_semaphore = buffer_semaphore.clone();
         let shutdown_flag = shutdown_flag.clone();
+        let done_guard = FetchDoneGuard {
+            buffer_semaphore: buffer_semaphore.clone(),
+            _stop_logging: stop_logging_tx,
+        };
         move || {
+            let _done_guard = done_guard;
             let mut next_expected = start_height;
             let mut buffer = BTreeMap::new();
             loop {
@@ -267,13 +327,18 @@ pub fn fetch_blocks_from_with_buffer_limit(
         pool.execute(move || {
             if shutdown_flag.load(Ordering::SeqCst) {
                 // If shutdown has already been requested, skip fetching.
+                stats.decrement_fetching();
                 return;
             }
 
             // Reserve buffer capacity BEFORE starting the expensive RPC call. This guarantees that
             // once the block is fetched there will always be space for it in the in-memory buffer
             // or the downstream channels, preventing deadlocks when an earlier block is delayed.
-            buffer_semaphore.acquire();
+            // Fails once the fetch has ended (consumer gone or shutdown), in which case we skip.
+            if !buffer_semaphore.acquire() {
+                stats.decrement_fetching();
+                return;
+            }
 
             let client = match bitcoin_rpc_pool.get() {
                 Ok(c) => c,
@@ -285,7 +350,17 @@ pub fn fetch_blocks_from_with_buffer_limit(
                 }
             };
 
-            match get_block_with_retries(&client, BlockLocator::Height(height)) {
+            let cancelled = || shutdown_flag.load(Ordering::SeqCst) || buffer_semaphore.is_closed();
+            let Some(result) =
+                get_block_with_retries_until(&client, BlockLocator::Height(height), cancelled)
+            else {
+                trace!("Fetch of block {} cancelled", height);
+                buffer_semaphore.release();
+                stats.decrement_fetching();
+                return;
+            };
+
+            match result {
                 Ok(Some(block)) => {
                     if intermediate_sender.send((height, block)).is_err() {
                         trace!("Intermediate receiver disconnected");
@@ -312,31 +387,39 @@ pub fn fetch_blocks_from_with_buffer_limit(
     Ok((final_rx, stats))
 }
 
-pub fn get_block_with_retries(
+/// Fetches a block, retrying failed attempts with exponential backoff, but gives up (returning
+/// `None`) as soon as `cancelled` returns true, so a worker never keeps retrying after its fetch
+/// has ended.
+fn get_block_with_retries_until(
     client: &Client,
     locator: BlockLocator,
-) -> Result<Option<Block>, bitcoincore_rpc::Error> {
+    cancelled: impl Fn() -> bool,
+) -> Option<Result<Option<Block>, bitcoincore_rpc::Error>> {
     let mut errors = 0;
     loop {
+        if cancelled() {
+            return None;
+        }
         match get_block_attempt(client, &locator) {
             Err(err) => {
                 errors += 1;
-                let seconds = 1 << errors;
+                let seconds = (1u64 << errors.min(7)).min(120);
                 let loc_str = match locator {
                     BlockLocator::Height(h) => h.to_string(),
-                    BlockLocator::Hash(ref h) => h.to_string(),
                 };
                 warn!(
                     "Failed to fetch block {}: retrying in {}s: {}",
                     loc_str, seconds, err
                 );
-                if seconds > 120 {
-                    thread::sleep(Duration::from_secs(120));
-                } else {
-                    thread::sleep(Duration::from_secs(seconds));
+                // Sleep in short steps so cancellation is noticed promptly.
+                for _ in 0..seconds {
+                    if cancelled() {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_secs(1));
                 }
             }
-            Ok(result) => return Ok(result),
+            Ok(result) => return Some(Ok(result)),
         }
     }
 }
@@ -347,9 +430,8 @@ fn get_block_attempt(
 ) -> Result<Option<Block>, bitcoincore_rpc::Error> {
     match locator {
         BlockLocator::Height(height) => {
-            let hash = client.get_block_hash((*height).into()).into_option()?;
-            hash.map(|hash| Ok(client.get_block(&hash)?)).transpose()
+            let hash = client.get_block_hash(*height).into_option()?;
+            hash.map(|hash| client.get_block(&hash)).transpose()
         }
-        BlockLocator::Hash(hash) => Ok(client.get_block(hash).into_option()?),
     }
 }

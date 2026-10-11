@@ -1,3 +1,4 @@
+use arch_titan_types_core::SerializedTxid;
 use bitcoin::Transaction;
 use bitcoincore_rpc::json::GetMempoolEntryResult;
 use bitcoincore_rpc::RpcApi;
@@ -8,7 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use threadpool::ThreadPool;
-use arch_titan_types_core::SerializedTxid;
 use tracing::error;
 
 use crate::bitcoin_rpc::{RpcClientError, RpcClientPool};
@@ -28,7 +28,7 @@ pub enum MempoolError {
 /// The results are sent over a channel and then collected into a HashMap.
 pub fn fetch_transactions(
     bitcoin_rpc_pool: RpcClientPool,
-    txids: &Vec<SerializedTxid>,
+    txids: &[SerializedTxid],
     interrupt: Arc<AtomicBool>,
 ) -> HashMap<SerializedTxid, Transaction> {
     // Create an MPSC channel to collect fetched transactions.

@@ -1,9 +1,9 @@
 use rustc_hash::FxHashMap as HashMap;
 
-use bitcoin::{ScriptBuf, Transaction};
 use arch_titan_types_core::{
     InscriptionId, Rune, RuneId, SerializedOutPoint, SerializedTxid, SpenderReference, TxOut,
 };
+use bitcoin::{ScriptBuf, Transaction};
 
 use crate::{
     index::StoreError,

@@ -5,7 +5,7 @@ use {
         SubscribeError,
     },
     bitcoin::{consensus::encode, Transaction},
-    std::{sync::Arc, thread},
+    std::sync::Arc,
     tokio::sync::watch,
     tracing::{debug, error, info},
 };
@@ -13,16 +13,16 @@ use {
 #[derive(Debug, thiserror::Error)]
 pub enum ZmqError {
     #[error("ZMQ read error: {0}")]
-    ReadError(#[from] RecvError),
+    Read(#[from] RecvError),
 
     #[error("ZMQ socket error: {0}")]
-    SocketError(#[from] SocketError),
+    Socket(#[from] SocketError),
 
     #[error("ZMQ error: {0}")]
-    AsyncZmqError(#[from] AsyncZmqError),
+    AsyncZmq(#[from] AsyncZmqError),
 
     #[error("ZMQ subscribe error: {0}")]
-    SubscribeError(#[from] SubscribeError),
+    Subscribe(#[from] SubscribeError),
 }
 
 /// Asynchronous ZMQ listener
@@ -58,7 +58,7 @@ pub async fn zmq_listener(
                             Ok(frames) => frames,
                             Err(e) => {
                                 error!("ZMQ read error: {:?}", e);
-                                return Err(ZmqError::ReadError(e));
+                                return Err(ZmqError::Read(e));
                             }
                         };
 

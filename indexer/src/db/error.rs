@@ -16,8 +16,6 @@ pub enum RocksDBError {
     InvalidRuneId,
     #[error("invalid txid")]
     InvalidTxid,
-    #[error("invalid outpoint")]
-    InvalidOutpoint,
     #[error("poisoned lock")]
     LockPoisoned,
     #[error("not found: {0}")]
@@ -26,4 +24,6 @@ pub enum RocksDBError {
     Overflow,
     #[error("schema version mismatch: {0}")]
     SchemaMismatch(String),
+    #[error("corrupt stored value: {0}")]
+    Deserialize(String),
 }

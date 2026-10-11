@@ -9,17 +9,33 @@ use {
                 Instructions,
             },
         },
-        Script, Transaction,
+        taproot::TAPROOT_ANNEX_PREFIX,
+        Script, Transaction, Witness,
     },
     serde::{Deserialize, Serialize},
     std::{collections::BTreeMap, iter::Peekable},
 };
 
 pub(crate) const PROTOCOL_ID: [u8; 3] = *b"ord";
-pub(crate) const BODY_TAG: [u8; 0] = [];
 
 type Result<T> = std::result::Result<T, bitcoin::script::Error>;
 type RawEnvelope = Envelope<Vec<Vec<u8>>>;
+
+/// Returns the leaf script of a witness the way ord does (ord calls the deprecated
+/// `Witness::tapscript` here): the second-to-last element, or the third-to-last one when the last
+/// element is an annex (starts with `0x50`) and there are at least two elements. Like ord, this
+/// does not check that the input actually spends a P2TR output, nor the control block or leaf
+/// version, so it returns scripts for any witness program and leaf version.
+pub(crate) fn unversioned_leaf_script_from_witness(witness: &Witness) -> Option<&Script> {
+    let last = witness.last()?;
+    let leaf_script = if witness.len() >= 2 && last.first() == Some(&TAPROOT_ANNEX_PREFIX) {
+        witness.third_to_last()?
+    } else {
+        witness.second_to_last()?
+    };
+    Some(Script::from_bytes(leaf_script))
+}
+
 pub(crate) type ParsedEnvelope = Envelope<Inscription>;
 
 #[derive(Default, PartialEq, Clone, Serialize, Deserialize, Debug, Eq)]
@@ -41,16 +57,11 @@ impl From<RawEnvelope> for ParsedEnvelope {
 
         let mut fields: BTreeMap<&[u8], Vec<&[u8]>> = BTreeMap::new();
 
-        let mut incomplete_field = false;
-
         for item in envelope.payload[..body.unwrap_or(envelope.payload.len())].chunks(2) {
-            match item {
-                [key, value] => fields.entry(key).or_default().push(value),
-                _ => incomplete_field = true,
+            if let [key, value] = item {
+                fields.entry(key).or_default().push(value);
             }
         }
-
-        let duplicate_field = fields.iter().any(|(_key, values)| values.len() > 1);
 
         let content_encoding = Tag::ContentEncoding.take(&mut fields);
         let content_type = Tag::ContentType.take(&mut fields);
@@ -99,7 +110,7 @@ impl RawEnvelope {
         let mut envelopes = Vec::new();
 
         for (i, input) in transaction.input.iter().enumerate() {
-            if let Some(tapscript) = input.witness.tapscript() {
+            if let Some(tapscript) = unversioned_leaf_script_from_witness(&input.witness) {
                 if let Ok(input_envelopes) = Self::from_tapscript(tapscript, i) {
                     envelopes.extend(input_envelopes);
                 }
@@ -248,5 +259,52 @@ impl RawEnvelope {
                 Some(_) => return Ok((false, None)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unversioned_leaf_script_matches_ord() {
+        let script = vec![0x51, 0x52];
+        let annex = vec![TAPROOT_ANNEX_PREFIX, 0x01];
+        let control_block = vec![0xc0; 33];
+        // Unknown leaf version and a too-short control block are not filtered, as in ord.
+        let odd_control_block = vec![0xc1];
+
+        let witnesses: Vec<Vec<Vec<u8>>> = vec![
+            vec![],
+            vec![script.clone()],
+            vec![script.clone(), annex.clone()],
+            vec![script.clone(), control_block.clone()],
+            vec![script.clone(), Vec::new()],
+            vec![script.clone(), odd_control_block.clone()],
+            vec![vec![0xaa], script.clone(), control_block.clone()],
+            vec![script.clone(), control_block.clone(), annex.clone()],
+            vec![vec![0xaa], script.clone(), odd_control_block, annex.clone()],
+            vec![annex.clone(), annex.clone()],
+            vec![script.clone(), annex.clone(), annex],
+        ];
+
+        for elements in witnesses {
+            let witness = Witness::from_slice(&elements);
+            #[allow(deprecated)]
+            let expected = witness.tapscript();
+            assert_eq!(
+                unversioned_leaf_script_from_witness(&witness),
+                expected,
+                "witness: {elements:?}"
+            );
+        }
+
+        assert_eq!(
+            unversioned_leaf_script_from_witness(&Witness::from_slice(&[
+                script.clone(),
+                control_block,
+            ])),
+            Some(Script::from_bytes(&script))
+        );
     }
 }

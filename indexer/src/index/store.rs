@@ -6,16 +6,19 @@ use {
             TransactionStateChange,
         },
     },
-    bitcoin::{consensus, hex::HexToArrayError, BlockHash, ScriptBuf},
-    rustc_hash::FxHashMap as HashMap,
-    thiserror::Error,
     arch_titan_types_api::{Pagination, PaginationResponse},
     arch_titan_types_core::RuneId,
     arch_titan_types_core::{
         Block, InscriptionId, MempoolEntry, Rune, SerializedOutPoint, SerializedTxid,
         SpenderReference, SpentStatus, Transaction, TransactionStatus, TxOut,
     },
+    bitcoin::{consensus, hex::HexToArrayError, BlockHash, ScriptBuf},
+    rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet},
+    thiserror::Error,
 };
+
+/// The previous outputs spent by a transaction's inputs and its own outputs, in order.
+pub type InputsOutputs = (Vec<Option<TxOut>>, Vec<Option<TxOut>>);
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -59,34 +62,31 @@ pub trait Store {
 
     // block
     fn get_block_count(&self) -> Result<u64, StoreError>;
-    fn set_block_count(&self, count: u64) -> Result<(), StoreError>;
     fn get_purged_blocks_count(&self) -> Result<u64, StoreError>;
 
     fn get_block_hash(&self, height: u64) -> Result<BlockHash, StoreError>;
-    fn get_block_hashes_by_height(
-        &self,
-        from_height: u64,
-        to_height: u64,
-    ) -> Result<Vec<BlockHash>, StoreError>;
-
-    fn delete_block_hash(&self, height: u64) -> Result<(), StoreError>;
 
     fn get_block_by_hash(&self, hash: &BlockHash) -> Result<Block, StoreError>;
-    fn get_blocks_by_hashes(
-        &self,
-        hashes: &Vec<BlockHash>,
-    ) -> Result<HashMap<BlockHash, Block>, StoreError>;
     fn get_blocks_by_heights(
         &self,
         from_height: u64,
         to_height: u64,
     ) -> Result<HashMap<u64, Block>, StoreError>;
 
-    fn delete_block(&self, hash: &BlockHash) -> Result<(), StoreError>;
-
     // mempool
     fn is_tx_in_mempool(&self, txid: &SerializedTxid) -> Result<bool, StoreError>;
     fn get_mempool_txids(&self) -> Result<HashMap<SerializedTxid, MempoolEntry>, StoreError>;
+    fn get_mempool_count(&self) -> Result<usize, StoreError>;
+    /// Mempool txids in txid byte order.
+    fn get_mempool_txids_page(
+        &self,
+        pagination: Pagination,
+    ) -> Result<PaginationResponse<SerializedTxid>, StoreError>;
+    /// Mempool entries in txid byte order.
+    fn get_mempool_entries_page(
+        &self,
+        pagination: Pagination,
+    ) -> Result<PaginationResponse<(SerializedTxid, MempoolEntry)>, StoreError>;
     fn get_mempool_entry(&self, txid: &SerializedTxid) -> Result<MempoolEntry, StoreError>;
     fn get_mempool_entries(
         &self,
@@ -103,10 +103,6 @@ pub trait Store {
         outpoint: &SerializedOutPoint,
         mempool: Option<bool>,
     ) -> Result<TxOut, StoreError>;
-    fn get_all_tx_outs(
-        &self,
-        mempool: bool,
-    ) -> Result<HashMap<SerializedOutPoint, TxOut>, StoreError>;
     fn get_tx_out_with_mempool_spent_update(
         &self,
         outpoint: &SerializedOutPoint,
@@ -124,11 +120,6 @@ pub trait Store {
     ) -> Result<HashMap<SerializedOutPoint, TxOut>, StoreError>;
 
     // transaction changes
-    fn get_tx_state_changes(
-        &self,
-        txid: &SerializedTxid,
-        mempool: Option<bool>,
-    ) -> Result<TransactionStateChange, StoreError>;
     fn get_txs_state_changes(
         &self,
         txids: &[SerializedTxid],
@@ -158,10 +149,10 @@ pub trait Store {
         &self,
         transaction: &bitcoin::Transaction,
         txid: &SerializedTxid,
-    ) -> Result<(Vec<Option<TxOut>>, Vec<Option<TxOut>>), StoreError>;
+    ) -> Result<InputsOutputs, StoreError>;
     fn partition_transactions_by_existence(
         &self,
-        txids: &Vec<SerializedTxid>,
+        txids: &[SerializedTxid],
     ) -> Result<(Vec<SerializedTxid>, Vec<SerializedTxid>), StoreError>;
 
     // rune transactions
@@ -178,7 +169,7 @@ pub trait Store {
     fn get_rune_id(&self, rune: &Rune) -> Result<RuneId, StoreError>;
     fn get_runes_by_ids(
         &self,
-        rune_ids: &Vec<RuneId>,
+        rune_ids: &[RuneId],
     ) -> Result<HashMap<RuneId, RuneEntry>, StoreError>;
     fn get_runes(
         &self,
@@ -194,12 +185,12 @@ pub trait Store {
         script_pubkey: &ScriptBuf,
         mempool: Option<bool>,
     ) -> Result<Vec<SerializedOutPoint>, StoreError>;
-    fn get_outpoints_to_script_pubkey(
+    /// One page of `get_script_pubkey_outpoints(script_pubkey, None)`, same set and order.
+    fn get_script_pubkey_outpoints_page(
         &self,
-        outpoints: &[SerializedOutPoint],
-        mempool: Option<bool>,
-        optimistic: bool,
-    ) -> Result<HashMap<SerializedOutPoint, ScriptBuf>, StoreError>;
+        script_pubkey: &ScriptBuf,
+        pagination: Pagination,
+    ) -> Result<PaginationResponse<SerializedOutPoint>, StoreError>;
 
     // batch
     fn batch_update(&self, update: &BatchUpdate, mempool: bool) -> Result<(), StoreError>;
@@ -249,10 +240,6 @@ impl Store for RocksDB {
         Ok(self.get_block_count()?)
     }
 
-    fn set_block_count(&self, count: u64) -> Result<(), StoreError> {
-        Ok(self.set_block_count(count)?)
-    }
-
     fn get_purged_blocks_count(&self) -> Result<u64, StoreError> {
         Ok(self.get_purged_blocks_count()?)
     }
@@ -261,27 +248,8 @@ impl Store for RocksDB {
         Ok(self.get_block_hash(height)?)
     }
 
-    fn get_block_hashes_by_height(
-        &self,
-        from_height: u64,
-        to_height: u64,
-    ) -> Result<Vec<BlockHash>, StoreError> {
-        Ok(self.get_block_hashes_by_height(from_height, to_height)?)
-    }
-
-    fn delete_block_hash(&self, height: u64) -> Result<(), StoreError> {
-        Ok(self.delete_block_hash(height)?)
-    }
-
     fn get_block_by_hash(&self, hash: &BlockHash) -> Result<Block, StoreError> {
-        Ok(self.get_block_by_hash(&hash)?)
-    }
-
-    fn get_blocks_by_hashes(
-        &self,
-        hashes: &Vec<BlockHash>,
-    ) -> Result<HashMap<BlockHash, Block>, StoreError> {
-        Ok(self.get_blocks_by_hashes(hashes)?)
+        Ok(self.get_block_by_hash(hash)?)
     }
 
     fn get_blocks_by_heights(
@@ -300,13 +268,9 @@ impl Store for RocksDB {
         Ok(result)
     }
 
-    fn delete_block(&self, hash: &BlockHash) -> Result<(), StoreError> {
-        Ok(self.delete_block(&hash)?)
-    }
-
     fn get_runes_by_ids(
         &self,
-        rune_ids: &Vec<RuneId>,
+        rune_ids: &[RuneId],
     ) -> Result<HashMap<RuneId, RuneEntry>, StoreError> {
         Ok(self.get_runes_by_ids(rune_ids)?)
     }
@@ -337,6 +301,26 @@ impl Store for RocksDB {
 
     fn get_mempool_txids(&self) -> Result<HashMap<SerializedTxid, MempoolEntry>, StoreError> {
         Ok(self.get_mempool_txids()?)
+    }
+
+    fn get_mempool_count(&self) -> Result<usize, StoreError> {
+        Ok(self.get_mempool_count()?)
+    }
+
+    fn get_mempool_txids_page(
+        &self,
+        pagination: Pagination,
+    ) -> Result<PaginationResponse<SerializedTxid>, StoreError> {
+        let items = self.get_mempool_txids_page(pagination.skip, pagination.limit)?;
+        Ok(page_response(pagination, items))
+    }
+
+    fn get_mempool_entries_page(
+        &self,
+        pagination: Pagination,
+    ) -> Result<PaginationResponse<(SerializedTxid, MempoolEntry)>, StoreError> {
+        let items = self.get_mempool_entries_page(pagination.skip, pagination.limit)?;
+        Ok(page_response(pagination, items))
     }
 
     fn is_tx_in_mempool(&self, txid: &SerializedTxid) -> Result<bool, StoreError> {
@@ -370,20 +354,13 @@ impl Store for RocksDB {
             Ok(self.get_tx_out(outpoint, mempool)?)
         } else {
             match self.get_tx_out(outpoint, false) {
-                Ok(tx_out) => return Ok(tx_out),
+                Ok(tx_out) => Ok(tx_out),
                 Err(err) => match err {
                     RocksDBError::NotFound(_) => Ok(self.get_tx_out(outpoint, true)?),
                     other => Err(StoreError::DB(other)),
                 },
             }
         }
-    }
-
-    fn get_all_tx_outs(
-        &self,
-        mempool: bool,
-    ) -> Result<HashMap<SerializedOutPoint, TxOut>, StoreError> {
-        Ok(self.get_all_tx_outs(mempool)?)
     }
 
     fn get_tx_out_with_mempool_spent_update(
@@ -404,15 +381,12 @@ impl Store for RocksDB {
         };
 
         let spent_outpoints: HashMap<SerializedOutPoint, Option<SpenderReference>> =
-            self.get_spent_outpoints_in_mempool(&vec![*outpoint])?;
+            self.get_spent_outpoints_in_mempool(&[*outpoint])?;
 
         let spent_in_mempool = spent_outpoints.get(outpoint);
 
-        match spent_in_mempool {
-            Some(Some(spent)) => {
-                tx_out.spent = SpentStatus::Spent(spent.clone());
-            }
-            _ => {}
+        if let Some(Some(spent)) = spent_in_mempool {
+            tx_out.spent = SpentStatus::Spent(spent.clone());
         }
 
         Ok(tx_out)
@@ -438,33 +412,12 @@ impl Store for RocksDB {
         for (outpoint, output) in tx_outs.iter_mut() {
             let spent_in_mempool = spent_outpoints.get(outpoint);
 
-            match spent_in_mempool {
-                Some(Some(spent)) => {
-                    output.spent = SpentStatus::Spent(spent.clone());
-                }
-                _ => {}
+            if let Some(Some(spent)) = spent_in_mempool {
+                output.spent = SpentStatus::Spent(spent.clone());
             }
         }
 
         Ok(tx_outs)
-    }
-
-    fn get_tx_state_changes(
-        &self,
-        txid: &SerializedTxid,
-        mempool: Option<bool>,
-    ) -> Result<TransactionStateChange, StoreError> {
-        if let Some(mempool) = mempool {
-            Ok(self.get_tx_state_changes(txid, mempool)?)
-        } else {
-            match self.get_tx_state_changes(txid, false) {
-                Ok(tx_state_change) => return Ok(tx_state_change),
-                Err(err) => match err {
-                    RocksDBError::NotFound(_) => Ok(self.get_tx_state_changes(txid, true)?),
-                    other => Err(StoreError::DB(other)),
-                },
-            }
-        }
     }
 
     fn get_txs_state_changes(
@@ -480,7 +433,7 @@ impl Store for RocksDB {
         txid: &SerializedTxid,
         mempool: Option<bool>,
     ) -> Result<Transaction, StoreError> {
-        let (transaction, status, mempool) = if let Some(mempool) = mempool {
+        let (transaction, status, _mempool) = if let Some(mempool) = mempool {
             let status = if !mempool {
                 self.get_transaction_confirming_block(txid)?
                     .into_transaction_status()
@@ -526,7 +479,7 @@ impl Store for RocksDB {
         &self,
         transaction: &bitcoin::Transaction,
         txid: &SerializedTxid,
-    ) -> Result<(Vec<Option<TxOut>>, Vec<Option<TxOut>>), StoreError> {
+    ) -> Result<InputsOutputs, StoreError> {
         let prev_outpoints = transaction
             .input
             .iter()
@@ -570,7 +523,7 @@ impl Store for RocksDB {
             Ok(self.get_transaction_raw(txid, mempool)?)
         } else {
             match self.get_transaction_raw(txid, false) {
-                Ok(transaction) => return Ok(transaction),
+                Ok(transaction) => Ok(transaction),
                 Err(err) => match err {
                     RocksDBError::NotFound(_) => Ok(self.get_transaction_raw(txid, true)?),
                     other => Err(StoreError::DB(other)),
@@ -581,7 +534,7 @@ impl Store for RocksDB {
 
     fn partition_transactions_by_existence(
         &self,
-        txids: &Vec<SerializedTxid>,
+        txids: &[SerializedTxid],
     ) -> Result<(Vec<SerializedTxid>, Vec<SerializedTxid>), StoreError> {
         Ok(self.partition_transactions_by_existence(txids)?)
     }
@@ -623,40 +576,27 @@ impl Store for RocksDB {
         mempool: Option<bool>,
     ) -> Result<PaginationResponse<SerializedTxid>, StoreError> {
         if let Some(mempool) = mempool {
-            Ok(self.get_last_rune_transactions(rune_id, pagination, mempool)?)
-        } else {
-            // First get mempool transactions
-            let mempool_txids = self.get_last_rune_transactions(rune_id, pagination, true)?;
-
-            // Then get non-mempool transactions
-            // Adapt pagination to offset
-            let non_mempool_pagination = match pagination {
-                Some(pagination) => Pagination {
-                    skip: pagination.skip.saturating_sub(mempool_txids.offset),
-                    limit: pagination
-                        .limit
-                        .saturating_sub(mempool_txids.items.len() as u64),
-                },
-                None => Pagination {
-                    skip: 0,
-                    limit: u64::MAX,
-                },
-            };
-
-            let non_mempool_txids =
-                self.get_last_rune_transactions(rune_id, Some(non_mempool_pagination), false)?;
-
-            let new_offset = mempool_txids.offset + non_mempool_txids.offset;
-
-            Ok(PaginationResponse {
-                items: mempool_txids
-                    .items
-                    .into_iter()
-                    .chain(non_mempool_txids.items)
-                    .collect(),
-                offset: new_offset,
-            })
+            return Ok(self.get_last_rune_transactions(rune_id, pagination, mempool)?);
         }
+
+        // Mempool transactions are newer than confirmed ones, so the merged list is the mempool
+        // list followed by the confirmed list. `offset` is the `skip` of the next page.
+        let Pagination { skip, limit } = pagination.unwrap_or_default();
+
+        let (mut items, mempool_skipped) =
+            self.rune_transactions_page(rune_id, skip, limit, true)?;
+
+        // Whatever the mempool list could not absorb is skipped in the confirmed list.
+        let confirmed_skip = skip - mempool_skipped;
+        let confirmed_limit = limit - items.len() as u64;
+        if confirmed_limit > 0 {
+            let (confirmed_items, _) =
+                self.rune_transactions_page(rune_id, confirmed_skip, confirmed_limit, false)?;
+            items.extend(confirmed_items);
+        }
+
+        let offset = skip.saturating_add(items.len() as u64);
+        Ok(PaginationResponse { items, offset })
     }
 
     fn get_script_pubkey_outpoints(
@@ -670,7 +610,14 @@ impl Store for RocksDB {
             let mut ledger_entry = self.get_script_pubkey_outpoints(script_pubkey, false)?;
             let mempool_entry = self.get_script_pubkey_outpoints(script_pubkey, true)?;
 
-            ledger_entry.extend(mempool_entry);
+            // A just-confirmed transaction's outputs stay in the mempool index until
+            // mempool cleanup runs; list them once, as confirmed.
+            let confirmed: HashSet<SerializedOutPoint> = ledger_entry.iter().copied().collect();
+            ledger_entry.extend(
+                mempool_entry
+                    .into_iter()
+                    .filter(|outpoint| !confirmed.contains(outpoint)),
+            );
 
             // Get spent outpoints in mempool.
             let spent_outpoints = self.get_spent_outpoints_in_mempool(&ledger_entry)?;
@@ -687,34 +634,17 @@ impl Store for RocksDB {
         }
     }
 
-    fn get_outpoints_to_script_pubkey(
+    fn get_script_pubkey_outpoints_page(
         &self,
-        outpoints: &[SerializedOutPoint],
-        mempool: Option<bool>,
-        optimistic: bool,
-    ) -> Result<HashMap<SerializedOutPoint, ScriptBuf>, StoreError> {
-        let script_pubkeys = if let Some(mempool) = mempool {
-            self.get_outpoints_to_script_pubkey(outpoints, mempool, optimistic)?
-        } else {
-            let ledger_script_pubkeys =
-                self.get_outpoints_to_script_pubkey(outpoints, false, true)?;
-
-            let remaining_outpoints = outpoints
-                .iter()
-                .filter(|outpoint| !ledger_script_pubkeys.contains_key(outpoint))
-                .cloned()
-                .collect::<Vec<_>>();
-
-            let mempool_script_pubkeys =
-                self.get_outpoints_to_script_pubkey(&remaining_outpoints, true, optimistic)?;
-
-            ledger_script_pubkeys
-                .into_iter()
-                .chain(mempool_script_pubkeys)
-                .collect()
-        };
-
-        Ok(script_pubkeys)
+        script_pubkey: &ScriptBuf,
+        pagination: Pagination,
+    ) -> Result<PaginationResponse<SerializedOutPoint>, StoreError> {
+        let items = self.get_script_pubkey_outpoints_page(
+            script_pubkey,
+            pagination.skip,
+            pagination.limit,
+        )?;
+        Ok(page_response(pagination, items))
     }
 
     fn batch_update(&self, update: &BatchUpdate, mempool: bool) -> Result<(), StoreError> {
@@ -731,5 +661,254 @@ impl Store for RocksDB {
 
     fn finish_bulk_load(&self) -> Result<(), StoreError> {
         self.switch_to_online_mode().map_err(StoreError::DB)
+    }
+}
+
+/// `offset` follows the rune-transactions convention: the skip to send for the next page.
+fn page_response<T>(pagination: Pagination, items: Vec<T>) -> PaginationResponse<T> {
+    let offset = pagination.skip.saturating_add(items.len() as u64);
+    PaginationResponse { items, offset }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::db::testing::{add_rune_txs, remove_txs, txid, TempDb},
+    };
+
+    fn merged_page(
+        db: &RocksDB,
+        rune_id: RuneId,
+        skip: u64,
+        limit: u64,
+    ) -> PaginationResponse<SerializedTxid> {
+        Store::get_last_rune_transactions(db, &rune_id, Some(Pagination { skip, limit }), None)
+            .unwrap()
+    }
+
+    #[test]
+    fn merged_rune_transactions_paginate_mempool_then_confirmed() {
+        let db = TempDb::new();
+        let rune_id = RuneId::new(840_000, 1);
+
+        add_rune_txs(&db, &[(rune_id, (1..=300).map(txid).collect())], false);
+        add_rune_txs(&db, &[(rune_id, (1_001..=1_300).map(txid).collect())], true);
+        // Transactions leaving the mempool leave holes in its list.
+        let left: Vec<_> = (1_001..=1_300).filter(|n| n % 4 == 0).map(txid).collect();
+        remove_txs(&db, &left, true, vec![]);
+
+        let mempool: Vec<_> = (1_001..=1_300)
+            .rev()
+            .filter(|n| n % 4 != 0)
+            .map(txid)
+            .collect();
+        let confirmed: Vec<_> = (1..=300).rev().map(txid).collect();
+        let expected: Vec<_> = mempool.iter().chain(confirmed.iter()).cloned().collect();
+        let mempool_len = mempool.len() as u64;
+
+        // Following `offset` walks the whole merged list exactly once.
+        let mut items = Vec::new();
+        let mut skip = 0;
+        loop {
+            let page = merged_page(&db, rune_id, skip, 50);
+            assert!(page.items.len() <= 50);
+            assert_eq!(page.offset, skip + page.items.len() as u64);
+            if page.items.is_empty() {
+                break;
+            }
+            skip = page.offset;
+            items.extend(page.items);
+        }
+        assert_eq!(items, expected);
+
+        // A page straddling both lists.
+        let page = merged_page(&db, rune_id, mempool_len - 10, 50);
+        assert_eq!(page.items, expected[mempool_len as usize - 10..][..50]);
+
+        // Skipping past the mempool list skips into the confirmed one.
+        let page = merged_page(&db, rune_id, mempool_len + 5, 50);
+        assert_eq!(page.items, confirmed[5..55]);
+        assert_eq!(page.offset, mempool_len + 55);
+
+        let page = merged_page(&db, rune_id, 20, 0);
+        assert!(page.items.is_empty());
+        assert_eq!(page.offset, 20);
+
+        let page = Store::get_last_rune_transactions(&*db, &rune_id, None, None).unwrap();
+        assert_eq!(page.items, expected[..50]);
+        assert_eq!(page.offset, 50);
+    }
+
+    fn all_pages<T>(
+        limit: u64,
+        mut fetch: impl FnMut(Pagination) -> PaginationResponse<T>,
+    ) -> Vec<T> {
+        let mut items = Vec::new();
+        let mut skip = 0;
+        loop {
+            let page = fetch(Pagination { skip, limit });
+            assert!(page.items.len() as u64 <= limit);
+            assert_eq!(page.offset, skip + page.items.len() as u64);
+            if page.items.is_empty() {
+                return items;
+            }
+            skip = page.offset;
+            items.extend(page.items);
+        }
+    }
+
+    fn outpoint(n: u64) -> SerializedOutPoint {
+        SerializedOutPoint::from_txid_vout(&txid(n), 0)
+    }
+
+    fn mempool_entry(vsize: u64) -> MempoolEntry {
+        MempoolEntry {
+            vsize,
+            weight: None,
+            descendant_count: 1,
+            descendant_size: vsize,
+            ancestor_count: 1,
+            ancestor_size: vsize,
+            fees: arch_titan_types_core::MempoolEntryFee {
+                base: 1,
+                descendant: 1,
+                ancestor: 1,
+            },
+            depends: vec![],
+            spent_by: vec![],
+        }
+    }
+
+    #[test]
+    fn address_outpoint_pages_walk_the_merged_list() {
+        let db = TempDb::new();
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+
+        // More confirmed outputs than one spent-check chunk, then mempool-created ones.
+        let mut confirmed = BatchUpdate::new(0, 0, 0);
+        confirmed
+            .script_pubkeys
+            .insert(script.clone(), ((0..300).map(outpoint).collect(), vec![]));
+        db.batch_update(&confirmed, false).unwrap();
+
+        let mut mempool = BatchUpdate::new(0, 0, 0);
+        mempool.script_pubkeys.insert(
+            script.clone(),
+            ((1_000..1_005).map(outpoint).collect(), vec![]),
+        );
+        // Outputs spent in the mempool are left out, on both sides of the chunk boundary.
+        for n in [10, 299, 1_002] {
+            mempool.spent_outpoints_in_mempool.insert(
+                outpoint(n),
+                SpenderReference {
+                    txid: txid(9_000 + n),
+                    vin: 0,
+                },
+            );
+        }
+        db.batch_update(&mempool, true).unwrap();
+
+        let expected = Store::get_script_pubkey_outpoints(&*db, &script, None).unwrap();
+        assert_eq!(expected.len(), 302);
+        assert!(!expected.contains(&outpoint(10)));
+        assert!(!expected.contains(&outpoint(1_002)));
+        let mempool_created: Vec<_> = (1_000..1_005)
+            .filter(|n| *n != 1_002)
+            .map(outpoint)
+            .collect();
+        assert_eq!(expected[298..], mempool_created[..]);
+
+        for limit in [1, 7, 50] {
+            let paged = all_pages(limit, |pagination| {
+                Store::get_script_pubkey_outpoints_page(&*db, &script, pagination).unwrap()
+            });
+            assert_eq!(paged, expected, "limit {limit}");
+        }
+
+        let page = Store::get_script_pubkey_outpoints_page(
+            &*db,
+            &script,
+            Pagination {
+                skip: 295,
+                limit: 5,
+            },
+        )
+        .unwrap();
+        assert_eq!(page.items, expected[295..300]);
+        assert_eq!(page.offset, 300);
+    }
+
+    #[test]
+    fn address_outpoints_in_both_indexes_are_listed_once() {
+        let db = TempDb::new();
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+
+        let mut confirmed = BatchUpdate::new(0, 0, 0);
+        confirmed
+            .script_pubkeys
+            .insert(script.clone(), ((0..5).map(outpoint).collect(), vec![]));
+        db.batch_update(&confirmed, false).unwrap();
+
+        // 1..3 just confirmed but not yet removed from the mempool index.
+        let mut mempool = BatchUpdate::new(0, 0, 0);
+        mempool.script_pubkeys.insert(
+            script.clone(),
+            ([1, 2, 3, 100, 101].map(outpoint).to_vec(), vec![]),
+        );
+        db.batch_update(&mempool, true).unwrap();
+
+        // Confirmed outputs in key order, then the mempool-only ones.
+        let mut expected = Store::get_script_pubkey_outpoints(&*db, &script, Some(false)).unwrap();
+        assert_eq!(expected.len(), 5);
+        expected.extend(
+            Store::get_script_pubkey_outpoints(&*db, &script, Some(true))
+                .unwrap()
+                .into_iter()
+                .filter(|op| [outpoint(100), outpoint(101)].contains(op)),
+        );
+        assert_eq!(expected.len(), 7);
+        assert_eq!(
+            Store::get_script_pubkey_outpoints(&*db, &script, None).unwrap(),
+            expected
+        );
+        for limit in [1, 2, 3, 50] {
+            let paged = all_pages(limit, |pagination| {
+                Store::get_script_pubkey_outpoints_page(&*db, &script, pagination).unwrap()
+            });
+            assert_eq!(paged, expected, "limit {limit}");
+        }
+    }
+
+    #[test]
+    fn mempool_pages_walk_all_entries_in_txid_order() {
+        let db = TempDb::new();
+        let mut update = BatchUpdate::new(0, 0, 0);
+        for n in 0..120 {
+            update.mempool_txs.insert(txid(n), mempool_entry(100 + n));
+        }
+        db.batch_update(&update, true).unwrap();
+
+        let txids = all_pages(50, |pagination| {
+            Store::get_mempool_txids_page(&*db, pagination).unwrap()
+        });
+        let mut expected: Vec<_> = (0..120).map(txid).collect();
+        expected.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        assert_eq!(txids, expected);
+
+        let entries = all_pages(7, |pagination| {
+            Store::get_mempool_entries_page(&*db, pagination).unwrap()
+        });
+        assert_eq!(
+            entries.iter().map(|(txid, _)| *txid).collect::<Vec<_>>(),
+            expected
+        );
+        for (txid, entry) in &entries {
+            assert_eq!(*entry, Store::get_mempool_entry(&*db, txid).unwrap());
+        }
+
+        let page = Store::get_mempool_txids_page(&*db, Pagination { skip: 5, limit: 0 }).unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.offset, 5);
     }
 }

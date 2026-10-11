@@ -1,18 +1,19 @@
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::sync::Arc;
-use std::time::Duration;
 use arch_titan_types_api::TcpSubscriptionRequest;
 use arch_titan_types_core::{Event, EventType};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
-    sync::{mpsc, watch, RwLock},
+    sync::{mpsc, watch, RwLock, Semaphore},
 };
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const MAX_LINE: usize = 8 * 1024;
@@ -94,24 +95,97 @@ impl TcpSubscriptionManager {
     }
 }
 
-/// Run the TCP subscription server on the given address.
-/// This server listens for incoming TCP connections and spawns a task
-/// to handle each connection.
+/// Maximum concurrent TCP subscription connections.
+const MAX_CONNECTIONS: usize = 1024;
+/// Maximum concurrent TCP subscription connections from one IP address.
+const MAX_CONNECTIONS_PER_IP: usize = 16;
+/// Close a connection if the client sends nothing (e.g. `PING`) for this long.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Close a connection if a single write to it takes longer than this.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Backoff after a failed `accept` (e.g. EMFILE) before trying again.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Per-IP connection counts; a slot is released when its guard drops.
+#[derive(Default)]
+struct IpConnections {
+    counts: std::sync::Mutex<HashMap<IpAddr, usize>>,
+}
+
+struct IpSlot {
+    ip: IpAddr,
+    connections: Arc<IpConnections>,
+}
+
+impl IpConnections {
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<IpSlot> {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let count = counts.entry(ip).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_IP {
+            return None;
+        }
+        *count += 1;
+        Some(IpSlot {
+            ip,
+            connections: self.clone(),
+        })
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut counts = self
+            .connections
+            .counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Run the TCP subscription server on an already-bound listener.
+/// This server accepts incoming TCP connections and spawns a task
+/// to handle each connection, until a shutdown signal arrives.
 pub async fn run_tcp_subscription_server(
-    addr: &str,
+    listener: TcpListener,
     manager: Arc<TcpSubscriptionManager>,
     mut shutdown_rx: watch::Receiver<()>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(addr).await?;
-    info!("TCP Subscription Server listening on {}", addr);
+) {
+    let connection_permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let ip_connections = Arc::new(IpConnections::default());
 
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
-                let (socket, remote_addr) = accept_result?;
+                let (socket, remote_addr) = match accept_result {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        // Accept errors (EMFILE, ECONNABORTED, ...) are transient.
+                        warn!("TCP subscription accept error: {:?}", e);
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    }
+                };
+
+                let Ok(permit) = connection_permits.clone().try_acquire_owned() else {
+                    warn!("Rejecting TCP connection from {}: connection limit reached", remote_addr);
+                    continue;
+                };
+                let Some(ip_slot) = ip_connections.try_acquire(remote_addr.ip()) else {
+                    warn!("Rejecting TCP connection from {}: per-IP connection limit reached", remote_addr);
+                    continue;
+                };
+
                 info!("New TCP connection from {}", remote_addr);
                 let manager_clone = manager.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ip_slot = ip_slot;
                     if let Err(e) = handle_tcp_connection(socket, manager_clone).await {
                         error!("Error handling TCP connection from {}: {:?}", remote_addr, e);
                     }
@@ -123,19 +197,28 @@ pub async fn run_tcp_subscription_server(
             }
         }
     }
+}
 
-    Ok(())
+async fn write_line(writer: &mut OwnedWriteHalf, bytes: &[u8]) -> std::io::Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, async {
+        writer.write_all(bytes).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out"))?
 }
 
 /// Handle a single TCP connection:
 /// 1. Read a line (JSON) from the client specifying the event types to subscribe to.
 /// 2. Create an mpsc channel and register a subscription.
-/// 3. Spawn a task to forward events from the channel to the client.
-/// 4. Also monitor the connection (for further commands or disconnection) so that when the client disconnects, the subscription is removed.
+/// 3. Forward events from the channel to the client.
+/// 4. Also monitor the connection (for PINGs or disconnection); the connection is closed
+///    when the client disconnects, stays silent for `IDLE_TIMEOUT`, or a write stalls.
 async fn handle_tcp_connection(
     socket: TcpStream,
     manager: Arc<TcpSubscriptionManager>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Split the socket into reader and writer.
     let (reader, mut writer) = socket.into_split();
     let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_LINE));
@@ -145,7 +228,8 @@ async fn handle_tcp_connection(
         Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
         read_handshake_request(&mut lines, &mut writer),
     )
-    .await??;
+    .await?
+    .map_err(|e| e.to_string())?;
 
     info!("Received TCP subscription request: {:?}", request);
 
@@ -162,7 +246,22 @@ async fn handle_tcp_connection(
     manager.register(sub).await;
     info!("Registered TCP subscription with id {}", sub_id);
 
-    // Loop until the connection is closed.
+    let result = forward_events(&mut lines, &mut writer, &mut rx, sub_id).await;
+
+    manager.unregister(sub_id).await;
+    info!("Unregistered TCP subscription with id {}", sub_id);
+    result
+}
+
+async fn forward_events(
+    lines: &mut FramedRead<OwnedReadHalf, LinesCodec>,
+    writer: &mut OwnedWriteHalf,
+    rx: &mut mpsc::Receiver<Event>,
+    sub_id: Uuid,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let idle = tokio::time::sleep(IDLE_TIMEOUT);
+    tokio::pin!(idle);
+
     loop {
         tokio::select! {
             // Send events received from the channel to the client.
@@ -170,12 +269,11 @@ async fn handle_tcp_connection(
                 match maybe_event {
                     Some(event) => {
                         let json_bytes = serde_json::to_vec(&event)?;
-                        writer.write_all(&json_bytes).await?;
-                        writer.write_all(b"\n").await?;
+                        write_line(writer, &json_bytes).await?;
                     },
                     None => {
                         info!("Event channel closed for subscription {}", sub_id);
-                        break;
+                        return Ok(());
                     }
                 }
             }
@@ -183,36 +281,30 @@ async fn handle_tcp_connection(
             result = lines.next() => {
                 match result {
                     Some(Ok(line)) => {
+                        idle.as_mut().reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
                         let trimmed = line.trim();
                         if trimmed == "PING" {
-                            if let Err(e) = writer.write_all(b"PONG\n").await {
-                                error!("Failed to send PONG: {:?}", e);
-                                break;
-                            }
-                            if let Err(e) = writer.flush().await {
-                                error!("Failed to flush after PONG: {:?}", e);
-                                break;
-                            }
+                            write_line(writer, b"PONG").await?;
                         } else {
                             debug!("Received message from client: {}", trimmed);
                         }
                     }
                     Some(Err(e)) => {
                         error!("Error reading from TCP connection: {:?}", e);
-                        break;
+                        return Ok(());
                     }
                     None => {
                         info!("TCP client disconnected for subscription {}", sub_id);
-                        break;
+                        return Ok(());
                     }
                 }
             }
+            _ = &mut idle => {
+                info!("Closing idle TCP subscription {}", sub_id);
+                return Ok(());
+            }
         }
     }
-
-    manager.unregister(sub_id).await;
-    info!("Unregistered TCP subscription with id {}", sub_id);
-    Ok(())
 }
 
 async fn read_handshake_request(

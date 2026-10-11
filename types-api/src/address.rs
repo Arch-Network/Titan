@@ -1,14 +1,20 @@
 use {
+    arch_titan_types_core::{
+        RuneAmount, SerializedOutPoint, SpentStatus, TransactionStatus, TxOut,
+    },
     bitcoin::Txid,
     serde::{Deserialize, Serialize},
-    arch_titan_types_core::{RuneAmount, SerializedOutPoint, SpentStatus, TransactionStatus, TxOut},
 };
 
+/// Balance summary of an address. The outputs themselves are paginated separately
+/// (`GET /address/{address}/outputs`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddressData {
     pub value: u64,
     pub runes: Vec<RuneAmount>,
-    pub outputs: Vec<AddressTxOut>,
+    /// Number of outputs counted in `value`/`runes`, i.e. the total the outputs
+    /// endpoint pages through.
+    pub output_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

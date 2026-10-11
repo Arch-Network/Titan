@@ -182,8 +182,8 @@ mod tests {
         Ok(buffer)
     }
 
-    fn deserialize_entry(data: &[u8]) -> std::io::Result<MempoolEntry> {
-        MempoolEntry::deserialize_reader(&mut data.as_ref())
+    fn deserialize_entry(mut data: &[u8]) -> std::io::Result<MempoolEntry> {
+        MempoolEntry::deserialize_reader(&mut data)
     }
 
     fn serialize_fee(fee: &MempoolEntryFee) -> std::io::Result<Vec<u8>> {
@@ -192,8 +192,8 @@ mod tests {
         Ok(buffer)
     }
 
-    fn deserialize_fee(data: &[u8]) -> std::io::Result<MempoolEntryFee> {
-        MempoolEntryFee::deserialize_reader(&mut data.as_ref())
+    fn deserialize_fee(mut data: &[u8]) -> std::io::Result<MempoolEntryFee> {
+        MempoolEntryFee::deserialize_reader(&mut data)
     }
 
     #[test]

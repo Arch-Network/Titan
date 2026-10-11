@@ -8,7 +8,6 @@ use server::{Server, ServerConfig};
 use std::{io, panic, sync::Arc};
 use subscription::{
     shutdown_and_wait_subscription_tasks, spawn_subscription_tasks, SubscriptionSpawnResult,
-    WebhookSubscriptionManager,
 };
 use tokio::{
     signal::unix::{signal, SignalKind},
@@ -39,15 +38,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Prepare and validate configurations
     let settings = setup_settings(&options)?;
     let server_config = setup_server_config(&options)?;
+    validate_webhook_config(&server_config)?;
     validate_rpc(&settings)?;
 
     // 4. Open RocksDB
     let db_arc = open_rocks_db(&settings)?;
     set_panic_hook(db_arc.clone());
 
+    // Long-running services report here when they stop, so an early exit
+    // (e.g. a crashed listener) shuts the process down.
+    let (service_exit_tx, service_exit_rx) = tokio::sync::mpsc::unbounded_channel();
+
     // 5. If subscriptions are enabled, spawn the dispatcher + cleanup tasks
-    let spawn_subscription_result =
-        spawn_subscription_tasks(db_arc.clone(), options.clone().into());
+    let spawn_subscription_result = spawn_subscription_tasks(
+        db_arc.clone(),
+        options.clone().into(),
+        service_exit_tx.clone(),
+    )?;
 
     let (webhook_subscription_manager, event_sender) = match spawn_subscription_result.as_ref() {
         Some(sub) => (
@@ -63,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bitcoin_rpc_pool = RpcClientPool::new(
         Arc::new(settings.clone()),
         options.bitcoin_rpc_pool_size as usize,
+        options.bitcoin_rpc_limit as usize,
     );
 
     let index = Arc::new(Index::new(
@@ -78,22 +86,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    terminates unexpectedly (e.g., due to `Failed to update to tip`). When that happens
     //    we will initiate a graceful shutdown without relying on external signals.
     let (index_handle, index_shutdown_rx) =
-        spawn_background_threads(index.clone(), options.enable_zmq_listener).await;
+        spawn_background_threads(index.clone(), options.enable_zmq_listener).await?;
 
     // 8. Start the HTTP server
     let handle = Handle::new();
     let server = Server;
-    let http_server_jh = server.start(
+    let http_server_jh = match server.start(
         index.clone(),
-        webhook_subscription_manager
-            .unwrap_or(Arc::new(WebhookSubscriptionManager::new(db_arc.clone()))),
+        webhook_subscription_manager,
         bitcoin_rpc_pool.clone(),
         Arc::new(server_config),
         handle.clone(),
-    )?;
+        service_exit_tx,
+    ) {
+        Ok(jh) => jh,
+        Err(e) => {
+            error!("Failed to start HTTP server: {e}");
+            index.shutdown();
+            let _ = index_handle.join();
+            return Err(e.into());
+        }
+    };
 
-    // 9. Wait for SIGINT (Ctrl-C), SIGTERM, or the indexer thread finishing unexpectedly
-    wait_for_signals(index_shutdown_rx).await;
+    // 9. Wait for SIGINT (Ctrl-C), SIGTERM, the indexer thread finishing
+    //    unexpectedly, or a server task exiting.
+    wait_for_signals(index_shutdown_rx, service_exit_rx).await;
 
     // 10. Graceful shutdown (async)
     graceful_shutdown(
@@ -126,6 +143,21 @@ fn setup_server_config(options: &Options) -> Result<ServerConfig, Box<dyn std::e
     Ok(config)
 }
 
+/// Webhook subscription routes are admin-only, so refuse to start without a token.
+fn validate_webhook_config(config: &ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let has_token = config
+        .webhook_admin_token
+        .as_deref()
+        .is_some_and(|token| !token.is_empty());
+    if config.enable_webhook_subscriptions && !has_token {
+        return Err(
+            "--enable-webhook-subscriptions requires --webhook-admin-token (WEBHOOK_ADMIN_TOKEN)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Validate the RPC connection using your `validate_rpc_connection`
 fn validate_rpc(settings: &Settings) -> Result<(), Box<dyn std::error::Error>> {
     validate_rpc_connection(settings.get_new_rpc_client()?, settings.chain)?;
@@ -140,13 +172,23 @@ fn open_rocks_db(settings: &Settings) -> Result<Arc<RocksDB>, Box<dyn std::error
     Ok(Arc::new(db_instance))
 }
 
-/// Set a panic hook that closes or flushes the DB on panic
+/// Name of the indexer thread. A panic there leaves the index in an unknown
+/// state, so the panic hook flushes RocksDB and exits.
+const INDEXER_THREAD_NAME: &str = "titan-indexer";
+
+/// Set a panic hook that flushes the DB and exits on indexer-thread panics.
+/// Panics elsewhere (HTTP handlers, subscription tasks) are only logged; tokio
+/// confines them to the panicking task.
 fn set_panic_hook(db_arc: Arc<RocksDB>) {
     let db_for_panic = db_arc.clone();
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
         // Print the panic using the original hook
         original_hook(panic_info);
+
+        if std::thread::current().name() != Some(INDEXER_THREAD_NAME) {
+            return;
+        }
 
         if let Some(message) = panic_info.payload().downcast_ref::<String>() {
             error!("Panic occurred: {}, shutting down...", message);
@@ -166,10 +208,10 @@ fn set_panic_hook(db_arc: Arc<RocksDB>) {
 async fn spawn_background_threads(
     index: Arc<Index>,
     enable_zmq_listener: bool,
-) -> (
+) -> io::Result<(
     std::thread::JoinHandle<()>,
     tokio::sync::oneshot::Receiver<()>,
-) {
+)> {
     use tokio::sync::oneshot;
 
     // Channel used to notify the main async runtime that the indexer thread has
@@ -178,11 +220,13 @@ async fn spawn_background_threads(
 
     // 1) Spawn the indexer loop in a blocking thread
     let index_clone = index.clone();
-    let index_handle = std::thread::spawn(move || {
-        index_clone.index();
-        // Ignore send errors – it just means the receiver was dropped.
-        let _ = shutdown_tx.send(());
-    });
+    let index_handle = std::thread::Builder::new()
+        .name(INDEXER_THREAD_NAME.to_string())
+        .spawn(move || {
+            index_clone.index();
+            // Ignore send errors – it just means the receiver was dropped.
+            let _ = shutdown_tx.send(());
+        })?;
 
     // 2) Spawn the ZMQ listener (also likely blocking)
     if enable_zmq_listener {
@@ -190,13 +234,23 @@ async fn spawn_background_threads(
     }
 
     info!("Spawned background threads");
-    (index_handle, shutdown_rx)
+    Ok((index_handle, shutdown_rx))
 }
 
-/// Block until either SIGINT or SIGTERM is received
-async fn wait_for_signals(index_shutdown_rx: tokio::sync::oneshot::Receiver<()>) {
+/// Block until SIGINT or SIGTERM is received, the indexer thread ends, or a
+/// server task exits.
+async fn wait_for_signals(
+    index_shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    mut service_exit_rx: tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+) {
     use tokio::select;
-    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to open signal stream");
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(sigterm) => sigterm,
+        Err(e) => {
+            error!("Failed to open SIGTERM stream: {e}, shutting down...");
+            return;
+        }
+    };
 
     select! {
         _ = tokio::signal::ctrl_c() => {
@@ -207,6 +261,9 @@ async fn wait_for_signals(index_shutdown_rx: tokio::sync::oneshot::Receiver<()>)
         }
         _ = index_shutdown_rx => {
             info!("Indexer thread terminated, shutting down...");
+        }
+        Some(service) = service_exit_rx.recv() => {
+            error!("{service} exited unexpectedly, shutting down...");
         }
     }
 }

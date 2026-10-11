@@ -9,10 +9,9 @@ use std::{
     time::Duration,
 };
 
-use serde_json;
-use thiserror::Error;
 use arch_titan_types_api::TcpSubscriptionRequest;
 use arch_titan_types_core::Event;
+use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 use crate::tcp::reconnection::ReconnectionManager;
@@ -84,7 +83,7 @@ impl Default for TcpClientConfig {
 /// running briefly after the client is dropped.
 ///
 /// ```
-/// # use client::tcp_client_blocking::{TcpClient, TcpClientConfig};
+/// # use arch_titan_client::{TitanTcpClientBlocking as TcpClient, TitanTcpClientBlockingConfig as TcpClientConfig};
 /// # fn main() {
 /// let client = TcpClient::new(TcpClientConfig::default());
 /// // Use the client...
@@ -93,7 +92,6 @@ impl Default for TcpClientConfig {
 /// client.shutdown_and_join();
 /// # }
 /// ```
-#[cfg(feature = "tcp_client_blocking")]
 pub struct TcpClient {
     shutdown_flag: Arc<AtomicBool>,
     config: TcpClientConfig,
@@ -101,7 +99,6 @@ pub struct TcpClient {
     worker_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-#[cfg(feature = "tcp_client_blocking")]
 impl TcpClient {
     /// Creates a new TCP client with the given configuration.
     pub fn new(config: TcpClientConfig) -> Self {
@@ -152,8 +149,7 @@ impl TcpClient {
     ) -> Result<mpsc::Receiver<Event>, TcpClientError> {
         // Check if we already have a worker thread running
         let mut worker_lock = self.worker_thread.lock().map_err(|_| {
-            TcpClientError::IOError(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            TcpClientError::IOError(std::io::Error::other(
                 "Failed to acquire worker thread lock",
             ))
         })?;
@@ -239,7 +235,6 @@ impl TcpClient {
     }
 }
 
-#[cfg(feature = "tcp_client_blocking")]
 impl Drop for TcpClient {
     fn drop(&mut self) {
         // Signal thread to terminate
@@ -248,7 +243,7 @@ impl Drop for TcpClient {
         // Attempt to join the thread directly in the destructor
         // This is safe because we're taking ownership of the JoinHandle
         if let Ok(mut worker_lock) = self.worker_thread.lock() {
-            if let Some(handle) = worker_lock.take() {
+            if let Some(_handle) = worker_lock.take() {
                 // Don't block for too long in a destructor - it's generally not good practice
                 // Just log that we're not waiting for the thread
                 info!("TcpClient dropped, thread will continue running until shutdown completes");
@@ -306,24 +301,25 @@ fn subscribe(
             let connect_result = TcpStream::connect_timeout(&address, config.connection_timeout);
 
             match connect_result {
-                Ok(mut stream) => {
+                Ok(mut stream) => 'session: {
                     info!("Connected to server at {}", addr);
                     // Update status to Connected
                     update_status(ConnectionStatus::Connected);
 
-                    // Reset reconnection attempts after successful connection
-                    reconnection_manager.reset();
+                    // Backoff is only reset once the session proves healthy (first
+                    // event or PONG), so accept-then-close servers still back off.
+                    let mut session_healthy = false;
 
                     // Set read timeout - use shorter timeout to allow for ping checks
                     if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
                         error!("Failed to set read timeout: {}", e);
-                        continue;
+                        break 'session;
                     }
 
                     // Set write timeout
                     if let Err(e) = stream.set_write_timeout(Some(Duration::from_secs(5))) {
                         error!("Failed to set write timeout: {}", e);
-                        continue;
+                        break 'session;
                     }
 
                     // Clone the stream for reading.
@@ -331,7 +327,7 @@ fn subscribe(
                         Ok(rs) => rs,
                         Err(e) => {
                             error!("Failed to clone stream: {}", e);
-                            continue;
+                            break 'session;
                         }
                     };
                     let mut reader = BufReader::new(reader_stream);
@@ -341,20 +337,24 @@ fn subscribe(
                         Ok(req_json) => {
                             if let Err(e) = stream.write_all(req_json.as_bytes()) {
                                 error!("Failed to send subscription request: {}", e);
-                                continue;
+                                update_status(ConnectionStatus::Reconnecting);
+                                break 'session;
                             }
                             if let Err(e) = stream.write_all(b"\n") {
                                 error!("Failed to send newline: {}", e);
-                                continue;
+                                update_status(ConnectionStatus::Reconnecting);
+                                break 'session;
                             }
                             if let Err(e) = stream.flush() {
                                 error!("Failed to flush stream: {}", e);
-                                continue;
+                                update_status(ConnectionStatus::Reconnecting);
+                                break 'session;
                             }
                         }
                         Err(e) => {
                             error!("Failed to serialize subscription request: {}", e);
-                            break;
+                            update_status(ConnectionStatus::Disconnected);
+                            return;
                         }
                     }
 
@@ -363,7 +363,6 @@ fn subscribe(
 
                     // Ping-pong state tracking
                     let mut last_ping_time = std::time::Instant::now();
-                    let mut last_pong_time = std::time::Instant::now();
                     let mut awaiting_pong = false;
 
                     // Inner loop: read events from the connection with ping/pong support
@@ -377,35 +376,27 @@ fn subscribe(
                         // Current time
                         let now = std::time::Instant::now();
 
-                        // Handle ping-pong logic
-                        if now.duration_since(last_ping_time) >= config.ping_interval {
-                            if awaiting_pong {
-                                // Check if we've exceeded the pong timeout
-                                if now.duration_since(last_pong_time) >= config.pong_timeout {
-                                    warn!("Pong response timed out after {:?}, considering connection dead",
-                                          now.duration_since(last_pong_time));
-                                    update_status(ConnectionStatus::Reconnecting);
-                                    break;
-                                }
-                            } else {
-                                // Time to send a ping
-                                match stream.write_all(b"PING\n") {
-                                    Ok(_) => {
-                                        if let Err(e) = stream.flush() {
-                                            error!("Failed to flush after PING: {}", e);
-                                            update_status(ConnectionStatus::Reconnecting);
-                                            break;
-                                        }
-                                        last_ping_time = now;
-                                        awaiting_pong = true;
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to send PING: {}", e);
-                                        update_status(ConnectionStatus::Reconnecting);
-                                        break;
-                                    }
-                                }
+                        // Handle ping-pong logic: a PING must be answered (by a PONG
+                        // or any event) within `pong_timeout`.
+                        if awaiting_pong {
+                            if now.duration_since(last_ping_time) >= config.pong_timeout {
+                                warn!(
+                                    "Pong response timed out after {:?}, considering connection dead",
+                                    now.duration_since(last_ping_time)
+                                );
+                                update_status(ConnectionStatus::Reconnecting);
+                                break;
                             }
+                        } else if now.duration_since(last_ping_time) >= config.ping_interval {
+                            let ping_result =
+                                stream.write_all(b"PING\n").and_then(|_| stream.flush());
+                            if let Err(e) = ping_result {
+                                error!("Failed to send PING: {}", e);
+                                update_status(ConnectionStatus::Reconnecting);
+                                break;
+                            }
+                            last_ping_time = now;
+                            awaiting_pong = true;
                         }
 
                         // Set read timeout to allow for ping checks and shutdown signals
@@ -431,10 +422,11 @@ fn subscribe(
                                 if !message_bytes.is_empty() {
                                     // Check if this is a PONG response
                                     if message_bytes == b"PONG" {
-                                        if awaiting_pong {
-                                            awaiting_pong = false;
-                                            last_pong_time = std::time::Instant::now();
-                                            debug!("Received PONG");
+                                        debug!("Received PONG");
+                                        awaiting_pong = false;
+                                        if !session_healthy {
+                                            session_healthy = true;
+                                            reconnection_manager.reset();
                                         }
                                     } else {
                                         // Check if message size exceeds limit *before* parsing JSON
@@ -450,8 +442,11 @@ fn subscribe(
                                             match serde_json::from_slice::<Event>(message_bytes) {
                                                 Ok(event) => {
                                                     // Any successful message means the connection is alive
-                                                    last_pong_time = std::time::Instant::now();
-                                                    awaiting_pong = false; // Reset awaiting_pong if we received a valid event
+                                                    awaiting_pong = false;
+                                                    if !session_healthy {
+                                                        session_healthy = true;
+                                                        reconnection_manager.reset();
+                                                    }
 
                                                     if tx.send(event).is_err() {
                                                         error!("Receiver dropped. Exiting subscription thread.");
@@ -567,11 +562,11 @@ fn subscribe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, Read, Write};
+    use arch_titan_types_core::EventType;
+    use std::io::{BufRead, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::thread;
     use std::time::Duration;
-    use arch_titan_types_core::EventType;
 
     // Helper function to create a test TCP server
     fn start_test_server(ready_tx: std::sync::mpsc::Sender<SocketAddr>) -> JoinHandle<()> {
@@ -654,7 +649,7 @@ mod tests {
             subscribe: vec![EventType::TransactionsAdded],
         };
 
-        let rx = client
+        let _rx = client
             .subscribe(format!("{}", server_addr), subscription_request)
             .unwrap();
 

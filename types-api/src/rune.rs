@@ -1,6 +1,6 @@
 use {
-    serde::{Deserialize, Serialize},
     arch_titan_types_core::{InscriptionId, RuneId, SerializedTxid, SpacedRune},
+    serde::{Deserialize, Serialize},
 };
 
 mod serde_str {

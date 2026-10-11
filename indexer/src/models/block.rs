@@ -1,7 +1,7 @@
 use {
+    arch_titan_types_core::TransactionStatus,
     bitcoin::{hashes::Hash, BlockHash},
     borsh::{BorshDeserialize, BorshSerialize},
-    arch_titan_types_core::TransactionStatus,
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -22,7 +22,7 @@ impl BlockId {
 
 pub fn block_id_to_transaction_status(block_id: Option<&BlockId>) -> TransactionStatus {
     match block_id {
-        Some(block_id) => block_id.clone().into_transaction_status(),
+        Some(block_id) => (*block_id).into_transaction_status(),
         None => TransactionStatus::unconfirmed(),
     }
 }

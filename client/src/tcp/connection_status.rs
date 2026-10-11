@@ -29,7 +29,12 @@ impl StatusListener for std::sync::mpsc::Sender<ConnectionStatus> {
 // Implement for tokio mpsc::Sender
 impl StatusListener for tokio::sync::mpsc::Sender<ConnectionStatus> {
     fn notify(&self, status: ConnectionStatus) -> bool {
-        self.try_send(status).is_ok()
+        // A full channel only means the consumer is lagging; keep the listener
+        // registered and drop this update. Unregister only once it is closed.
+        !matches!(
+            self.try_send(status),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+        )
     }
 }
 
@@ -122,5 +127,29 @@ impl ConnectionStatusTracker {
 impl Default for ConnectionStatusTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokio_listener_survives_full_channel() {
+        let tracker = ConnectionStatusTracker::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tracker.register_listener(tx);
+
+        tracker.update_status(ConnectionStatus::Connecting);
+        // Channel is full: this update is dropped but the listener must stay.
+        tracker.update_status(ConnectionStatus::Reconnecting);
+        assert_eq!(rx.try_recv().unwrap(), ConnectionStatus::Connecting);
+
+        tracker.update_status(ConnectionStatus::Connected);
+        assert_eq!(rx.try_recv().unwrap(), ConnectionStatus::Connected);
+
+        drop(rx);
+        tracker.update_status(ConnectionStatus::Disconnected);
+        assert!(tracker.listeners.read().unwrap().is_empty());
     }
 }

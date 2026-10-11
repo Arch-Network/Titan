@@ -1,10 +1,10 @@
 use {
     super::RuneEntry,
-    bitcoin::ScriptBuf,
-    rustc_hash::FxHashMap as HashMap,
-    std::fmt::Display,
     arch_titan_types_core::RuneId,
     arch_titan_types_core::{InscriptionId, Rune, SerializedOutPoint, SerializedTxid, TxOut},
+    bitcoin::{BlockHash, ScriptBuf},
+    rustc_hash::FxHashMap as HashMap,
+    std::fmt::Display,
 };
 
 pub struct BatchRollback {
@@ -22,6 +22,11 @@ pub struct BatchRollback {
     pub inscriptions_to_delete: Vec<InscriptionId>,
     pub delete_all_rune_transactions: Vec<RuneId>,
     pub txs_to_delete: Vec<SerializedTxid>,
+
+    /// Reverted blocks (height, hash) to remove, in the same write as the reverted txs.
+    pub blocks_to_delete: Vec<(u64, BlockHash)>,
+    /// New persisted block count, written in the same write as the revert.
+    pub block_count: Option<u64>,
 }
 
 impl BatchRollback {
@@ -39,6 +44,8 @@ impl BatchRollback {
             inscriptions_to_delete: Vec::new(),
             delete_all_rune_transactions: Vec::new(),
             txs_to_delete: Vec::new(),
+            blocks_to_delete: Vec::new(),
+            block_count: None,
         }
     }
 }

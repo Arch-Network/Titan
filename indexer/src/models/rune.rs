@@ -1,11 +1,11 @@
 use std::io::{Read, Result, Write};
 
+use arch_titan_types_api::{MintResponse, RuneResponse};
+use arch_titan_types_core::{InscriptionId, Rune, RuneId, SerializedTxid, SpacedRune};
 use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::Terms;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use arch_titan_types_api::{MintResponse, RuneResponse};
-use arch_titan_types_core::{InscriptionId, Rune, RuneId, SerializedTxid, SpacedRune};
 
 #[derive(Debug, PartialEq, Error)]
 pub enum MintError {
@@ -118,23 +118,16 @@ impl RuneEntry {
     }
 
     pub fn to_rune_response(&self, id: RuneId, height: u64) -> RuneResponse {
-        let mintable = match self.mintable(height) {
-            Ok(_) => true,
-            Err(_) => false,
-        };
+        let mintable = self.mintable(height).is_ok();
 
-        let mint = if let Some(terms) = self.terms {
-            Some(MintResponse {
-                start: self.start(),
-                end: self.end(),
-                mintable,
-                cap: terms.cap.unwrap_or_default(),
-                amount: terms.amount.unwrap_or_default(),
-                mints: self.mints,
-            })
-        } else {
-            None
-        };
+        let mint = self.terms.map(|terms| MintResponse {
+            start: self.start(),
+            end: self.end(),
+            mintable,
+            cap: terms.cap.unwrap_or_default(),
+            amount: terms.amount.unwrap_or_default(),
+            mints: self.mints,
+        });
 
         RuneResponse {
             id,

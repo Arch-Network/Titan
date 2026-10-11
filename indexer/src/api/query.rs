@@ -1,9 +1,9 @@
 use {
     crate::index::{Index, IndexError},
-    bitcoin::BlockHash,
-    std::sync::Arc,
     arch_titan_types_api::query,
     arch_titan_types_core::RuneId,
+    bitcoin::BlockHash,
+    std::sync::Arc,
 };
 
 pub fn to_hash(block: &query::Block, index: &Arc<Index>) -> Result<BlockHash, IndexError> {

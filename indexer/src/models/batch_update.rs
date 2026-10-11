@@ -1,13 +1,13 @@
 use {
     super::{BlockId, Inscription, RuneEntry, TransactionStateChange},
-    bitcoin::{BlockHash, ScriptBuf, Transaction},
-    rustc_hash::FxHashMap as HashMap,
-    std::fmt::Display,
     arch_titan_types_core::RuneId,
     arch_titan_types_core::{
         Block, InscriptionId, MempoolEntry, SerializedOutPoint, SerializedTxid, SpenderReference,
         TxOut,
     },
+    bitcoin::{BlockHash, ScriptBuf, Transaction},
+    rustc_hash::FxHashMap as HashMap,
+    std::fmt::Display,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -72,27 +72,6 @@ impl BatchUpdate {
             && self.mempool_txs.is_empty()
             && self.transactions.is_empty()
             && self.transaction_confirming_block.is_empty()
-    }
-
-    /// Removes all per-batch collections while preserving the counter fields.
-    /// This lets the `HashMap`s keep their capacity, significantly reducing
-    /// the number of allocations that occur during repetitive flushing.
-    pub fn clear(&mut self) {
-        self.script_pubkeys.clear();
-        self.script_pubkeys_outpoints.clear();
-        self.spent_outpoints_in_mempool.clear();
-        self.blocks.clear();
-        self.block_hashes.clear();
-        self.txouts.clear();
-        self.tx_state_changes.clear();
-        self.rune_transactions.clear();
-        self.runes.clear();
-        self.rune_ids.clear();
-        self.rune_numbers.clear();
-        self.inscriptions.clear();
-        self.mempool_txs.clear();
-        self.transactions.clear();
-        self.transaction_confirming_block.clear();
     }
 }
 

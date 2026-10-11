@@ -35,18 +35,18 @@ where
     Ok(limit.min(default_limit()))
 }
 
-impl Into<Pagination> for (u64, u64) {
-    fn into(self) -> Pagination {
+impl From<(u64, u64)> for Pagination {
+    fn from(val: (u64, u64)) -> Self {
         Pagination {
-            skip: self.0,
-            limit: self.1,
+            skip: val.0,
+            limit: val.1,
         }
     }
 }
 
-impl Into<(u64, u64)> for Pagination {
-    fn into(self) -> (u64, u64) {
-        (self.skip, self.limit)
+impl From<Pagination> for (u64, u64) {
+    fn from(val: Pagination) -> Self {
+        (val.skip, val.limit)
     }
 }
 

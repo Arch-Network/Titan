@@ -1,4 +1,5 @@
 mod cleanup;
+mod endpoint;
 mod manager;
 mod process;
 mod store;

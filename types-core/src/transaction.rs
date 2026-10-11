@@ -87,7 +87,7 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn vbytes(&self) -> u64 {
-        (self.weight + WITNESS_SCALE_FACTOR as u64 - 1) / WITNESS_SCALE_FACTOR as u64
+        self.weight.div_ceil(WITNESS_SCALE_FACTOR as u64)
     }
 
     pub fn is_coinbase(&self) -> bool {
@@ -178,13 +178,13 @@ impl
             input: transaction
                 .input
                 .into_iter()
-                .zip(prev_outputs.into_iter())
+                .zip(prev_outputs)
                 .map(|(tx_in, prev_output)| TxIn::from((tx_in, prev_output)))
                 .collect(),
             output: transaction
                 .output
                 .into_iter()
-                .zip(outputs.into_iter())
+                .zip(outputs)
                 .map(|(tx_out, tx_out_entry)| {
                     let (runes, risky_runes, spent) = match tx_out_entry {
                         Some(tx_out_entry) => (
@@ -195,15 +195,13 @@ impl
                         None => (vec![], vec![], SpentStatus::SpentUnknown),
                     };
 
-                    let tx_out = TxOut {
+                    TxOut {
                         value: tx_out.value.to_sat(),
                         script_pubkey: tx_out.script_pubkey,
                         runes,
                         risky_runes,
                         spent,
-                    };
-
-                    tx_out
+                    }
                 })
                 .collect(),
             status,

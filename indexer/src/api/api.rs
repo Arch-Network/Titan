@@ -8,20 +8,20 @@ use {
         index::{Index, IndexError},
         subscription::{self, WebhookSubscriptionManager},
     },
-    bitcoin::{consensus, Address, BlockHash},
-    bitcoincore_rpc::RpcApi,
-    http::HeaderMap,
-    rustc_hash::FxHashMap as HashMap,
-    std::sync::Arc,
     arch_titan_types_api::{
-        query, AddressData, BlockTip, Pagination, PaginationResponse, RuneResponse, Status,
-        Subscription,
+        query, AddressData, AddressTxOut, BlockTip, MempoolTxEntry, Pagination, PaginationResponse,
+        RuneResponse, Status, Subscription,
     },
     arch_titan_types_core::{
         Block, InscriptionId, MempoolEntry, SerializedOutPoint, SerializedTxid, Transaction,
         TransactionStatus, TxOut,
     },
-    tracing::error,
+    bitcoin::{consensus, Address, BlockHash},
+    bitcoincore_rpc::RpcApi,
+    http::HeaderMap,
+    rustc_hash::FxHashMap as HashMap,
+    std::sync::Arc,
+    tracing::{error, warn},
     uuid::Uuid,
 };
 
@@ -34,19 +34,39 @@ pub enum ApiError {
     #[error("content error: {0}")]
     ContentError(#[from] ContentError),
     #[error("subscription error: {0}")]
-    SubscriptionError(#[from] subscription::WebhookStoreError),
+    SubscriptionError(#[from] subscription::WebhookSubscriptionError),
     #[error("hex error: {0}")]
     HexError(#[from] hex::FromHexError),
     #[error("consensus error: {0}")]
     ConsensusError(#[from] consensus::encode::Error),
+    #[error("bitcoind returned txid {returned} for transaction {expected}")]
+    TxidMismatch {
+        expected: bitcoin::Txid,
+        returned: bitcoin::Txid,
+    },
+    #[error("index has no blocks yet")]
+    IndexNotReady,
+}
+
+impl From<subscription::WebhookStoreError> for ApiError {
+    fn from(error: subscription::WebhookStoreError) -> Self {
+        Self::SubscriptionError(error.into())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
+/// Height and hash of the last indexed block, or `IndexNotReady` before the first.
+fn last_indexed_block(index: &Index) -> Result<(u64, BlockHash)> {
+    let height = index
+        .get_block_count()?
+        .checked_sub(1)
+        .ok_or(ApiError::IndexNotReady)?;
+    Ok((height, index.get_block_hash(height)?))
+}
+
 pub fn tip(index: Arc<Index>) -> Result<BlockTip> {
-    let block_count = index.get_block_count()?;
-    let height = block_count.saturating_sub(1);
-    let block_hash = index.get_block_hash(height)?;
+    let (height, block_hash) = last_indexed_block(&index)?;
     Ok(BlockTip {
         height,
         hash: block_hash.to_string(),
@@ -55,16 +75,15 @@ pub fn tip(index: Arc<Index>) -> Result<BlockTip> {
 }
 
 pub fn status(index: Arc<Index>) -> Result<Status> {
-    let block_count = index.get_block_count()?;
-    let block_hash = index.get_block_hash(block_count - 1)?;
+    let (height, block_hash) = last_indexed_block(&index)?;
     Ok(Status {
         block_tip: BlockTip {
-            height: block_count - 1,
+            height,
             hash: block_hash.to_string(),
             is_at_tip: index.get_is_at_tip()?,
         },
         runes_count: index.get_runes_count()?,
-        mempool_tx_count: index.get_mempool_txids()?.len() as u64,
+        mempool_tx_count: index.get_mempool_count()? as u64,
     })
 }
 
@@ -109,7 +128,7 @@ pub fn rune(index: Arc<Index>, rune_query: &query::Rune) -> Result<RuneResponse>
     let block_count = index.get_block_count()?;
     let rune_response = index
         .get_rune(&rune_id)?
-        .to_rune_response(rune_id, block_count - 1);
+        .to_rune_response(rune_id, block_count);
     Ok(rune_response)
 }
 
@@ -151,26 +170,51 @@ pub fn broadcast_transaction(
     let serialized_txid = txid.into();
 
     index.pre_index_new_submitted_transaction(&serialized_txid)?;
-
-    let new_txid = match client.send_raw_transaction(hex) {
-        Ok(txid) => txid,
-        Err(e) => {
-            index.remove_pre_index_new_submitted_transaction(&serialized_txid)?;
-            return Err(ApiError::RpcError(e));
-        }
+    // Whatever happens below, the txid must leave the pre-index set, otherwise
+    // mempool sync would skip this transaction forever.
+    let _pre_index_guard = PreIndexGuard {
+        index: &index,
+        txid: &serialized_txid,
     };
 
-    assert_eq!(new_txid, txid, "txid mismatch");
+    let new_txid = client.send_raw_transaction(hex)?;
+    if new_txid != txid {
+        return Err(ApiError::TxidMismatch {
+            expected: txid,
+            returned: new_txid,
+        });
+    }
 
-    let mempool_entry = client.get_mempool_entry(&new_txid)?;
-
-    index.index_new_submitted_transaction(
-        &serialized_txid,
-        &transaction,
-        MempoolEntry::from(&mempool_entry),
-    );
+    // The transaction is accepted at this point; if the entry lookup fails
+    // (RBF, mined, RPC busy) mempool sync will pick it up later.
+    match client.get_mempool_entry(&new_txid) {
+        Ok(mempool_entry) => index.index_new_submitted_transaction(
+            &client,
+            &serialized_txid,
+            &transaction,
+            MempoolEntry::from(&mempool_entry),
+        ),
+        Err(e) => warn!("Failed to get mempool entry for broadcast tx {txid}: {e}"),
+    }
 
     Ok(serialized_txid)
+}
+
+/// Removes a txid from the updater's pre-index set when dropped.
+struct PreIndexGuard<'a> {
+    index: &'a Index,
+    txid: &'a SerializedTxid,
+}
+
+impl Drop for PreIndexGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self
+            .index
+            .remove_pre_index_new_submitted_transaction(self.txid)
+        {
+            error!("Failed to remove pre-indexed txid {}: {}", self.txid, e);
+        }
+    }
 }
 
 pub fn bitcoin_transaction_raw(
@@ -207,9 +251,8 @@ pub fn transaction(
         let status = index.get_transaction_status(txid)?;
         let transaction = client.get_raw_transaction(&txid.into(), None)?;
         let (inputs, outputs) = index.get_inputs_outputs_from_transaction(&transaction, txid)?;
-        let transaction = Transaction::from((transaction, status, inputs, outputs));
 
-        transaction
+        Transaction::from((transaction, status, inputs, outputs))
     };
 
     Ok(transaction)
@@ -221,12 +264,13 @@ pub fn transaction_status(index: Arc<Index>, txid: &SerializedTxid) -> Result<Tr
 
 pub fn transaction_statuses(
     index: Arc<Index>,
-    txids: &Vec<SerializedTxid>,
+    txids: &[SerializedTxid],
     blockhash: &Option<BlockHash>,
 ) -> Result<HashMap<SerializedTxid, Option<TransactionStatus>>> {
     if let Some(blockhash) = blockhash {
-        let latest_block_hash = index.get_block_hash(index.get_block_count()? - 1)?;
-        if *blockhash != latest_block_hash {
+        let block_count = index.get_block_count()?;
+        let is_tip = block_count > 0 && *blockhash == index.get_block_hash(block_count - 1)?;
+        if !is_tip {
             return Err(ApiError::IndexError(IndexError::InvalidBestBlockHash(
                 blockhash.to_string(),
             )));
@@ -236,8 +280,11 @@ pub fn transaction_statuses(
     Ok(index.get_transactions_statuses(txids)?)
 }
 
-pub fn mempool_txids(index: Arc<Index>) -> Result<Vec<SerializedTxid>> {
-    Ok(index.get_mempool_txids()?)
+pub fn mempool_txids(
+    index: Arc<Index>,
+    pagination: Pagination,
+) -> Result<PaginationResponse<SerializedTxid>> {
+    Ok(index.get_mempool_txids(pagination)?)
 }
 
 pub fn mempool_tx(index: Arc<Index>, txid: &SerializedTxid) -> Result<MempoolEntry> {
@@ -246,38 +293,68 @@ pub fn mempool_tx(index: Arc<Index>, txid: &SerializedTxid) -> Result<MempoolEnt
 
 pub fn mempool_entries(
     index: Arc<Index>,
-    txids: &Vec<SerializedTxid>,
+    txids: &[SerializedTxid],
 ) -> Result<HashMap<SerializedTxid, Option<MempoolEntry>>> {
     Ok(index.get_mempool_entries(txids)?)
 }
 
-pub fn mempool_entries_all(index: Arc<Index>) -> Result<HashMap<SerializedTxid, MempoolEntry>> {
-    Ok(index.get_all_mempool_entries()?)
+pub fn mempool_entries_page(
+    index: Arc<Index>,
+    pagination: Pagination,
+) -> Result<PaginationResponse<MempoolTxEntry>> {
+    let page = index.get_mempool_entries_page(pagination)?;
+    Ok(PaginationResponse {
+        items: page
+            .items
+            .into_iter()
+            .map(|(txid, entry)| MempoolTxEntry {
+                txid: txid.into(),
+                entry,
+            })
+            .collect(),
+        offset: page.offset,
+    })
 }
 
 pub fn mempool_entries_with_ancestors(
     index: Arc<Index>,
-    txids: &Vec<SerializedTxid>,
+    txids: &[SerializedTxid],
 ) -> Result<HashMap<SerializedTxid, MempoolEntry>> {
     Ok(index.get_mempool_entries_with_ancestors(txids)?)
 }
 
 pub fn address(index: Arc<Index>, address: &Address) -> Result<AddressData> {
-    let outpoints = index.get_script_pubkey_outpoints(&address)?;
-    Ok(outpoints)
+    Ok(index.get_address_data(address)?)
 }
 
-pub fn subscriptions(
-    subscription_manager: Arc<WebhookSubscriptionManager>,
-) -> Result<Vec<Subscription>> {
-    Ok(subscription_manager.get_subscriptions()?)
+pub fn address_outputs(
+    index: Arc<Index>,
+    address: &Address,
+    pagination: Pagination,
+) -> Result<PaginationResponse<AddressTxOut>> {
+    Ok(index.get_address_outputs(address, pagination)?)
 }
 
-pub fn add_subscription(
+pub fn subscriptions(subscription_manager: Arc<WebhookSubscriptionManager>) -> Vec<Subscription> {
+    subscription_manager.get_subscriptions()
+}
+
+/// Body of `POST /subscription`. Accepts a full `Subscription` too: any `id` or
+/// `last_success_epoch_secs` sent by the client is ignored.
+#[derive(Debug, serde::Deserialize)]
+pub struct AddSubscriptionRequest {
+    pub endpoint: String,
+    pub event_types: Vec<arch_titan_types_core::EventType>,
+}
+
+/// Register a webhook. The id and timestamps are assigned by the server.
+pub async fn add_subscription(
     subscription_manager: Arc<WebhookSubscriptionManager>,
-    subscription: Subscription,
-) -> Result<()> {
-    Ok(subscription_manager.add_subscription(&subscription)?)
+    subscription: AddSubscriptionRequest,
+) -> Result<Subscription> {
+    Ok(subscription_manager
+        .add_subscription(&subscription.endpoint, subscription.event_types)
+        .await?)
 }
 
 pub fn delete_subscription(

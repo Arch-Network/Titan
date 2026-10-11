@@ -3,11 +3,11 @@ use {
         index::{store::Store, StoreError},
         models::{BatchRollback, RuneEntry},
     },
-    bitcoin::ScriptBuf,
-    rustc_hash::FxHashMap as HashMap,
-    std::sync::Arc,
     arch_titan_types_core::RuneId,
     arch_titan_types_core::{InscriptionId, Rune, SerializedOutPoint, SerializedTxid, TxOut},
+    bitcoin::{BlockHash, ScriptBuf},
+    rustc_hash::FxHashMap as HashMap,
+    std::sync::Arc,
     tracing::info,
 };
 
@@ -43,7 +43,7 @@ impl<'a> RollbackCache<'a> {
         Ok(())
     }
 
-    pub fn precache_runes(&mut self, rune_ids: &Vec<RuneId>) -> Result<()> {
+    pub fn precache_runes(&mut self, rune_ids: &[RuneId]) -> Result<()> {
         let runes = self.db.get_runes_by_ids(rune_ids)?;
         self.update.rune_entry.extend(runes);
         Ok(())
@@ -102,15 +102,10 @@ impl<'a> RollbackCache<'a> {
         self.update.delete_all_rune_transactions.push(rune_id);
     }
 
-    pub fn get_outpoints_to_script_pubkey(
-        &self,
-        outpoints: &[SerializedOutPoint],
-        optimistic: bool,
-    ) -> Result<HashMap<SerializedOutPoint, ScriptBuf>> {
-        let script_pubkeys =
-            self.db
-                .get_outpoints_to_script_pubkey(outpoints, Some(self.mempool), optimistic)?;
-        Ok(script_pubkeys)
+    /// Delete the block at `height` and set the block count to `height`.
+    pub fn delete_block(&mut self, height: u64, block_hash: BlockHash) {
+        self.update.blocks_to_delete.push((height, block_hash));
+        self.update.block_count = Some(height);
     }
 
     pub fn set_script_pubkey_entries(

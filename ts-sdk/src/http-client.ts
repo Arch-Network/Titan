@@ -1,6 +1,7 @@
 import axios, { AxiosInstance, AxiosError, AxiosRequestConfig } from 'axios';
 import {
   AddressData,
+  AddressTxOut,
   BlockTip,
   Pagination,
   PaginationResponse,
@@ -12,7 +13,16 @@ import {
   TransactionStatus,
   Block,
   MempoolEntry,
+  MempoolTxEntry,
 } from './types';
+
+export interface TitanHttpClientOptions {
+  /**
+   * Admin token for webhook subscription endpoints, sent as
+   * `Authorization: Bearer <token>`.
+   */
+  adminToken?: string;
+}
 
 /**
  * A HTTP client class for the Titan API. Each method corresponds
@@ -21,8 +31,10 @@ import {
 export class TitanHttpClient {
   private http: AxiosInstance;
   private baseUrl: string;
+  private adminToken?: string;
 
-  constructor(baseUrl: string) {
+  constructor(baseUrl: string, options: TitanHttpClientOptions = {}) {
+    this.adminToken = options.adminToken;
     // Remove any trailing slashes from the URL.
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.http = axios.create({
@@ -53,8 +65,23 @@ export class TitanHttpClient {
     return await this.get<string[]>(`/block/${query}/txids`);
   }
 
+  /** Balance summary of an address (value, runes and output count). */
   async getAddress(address: string): Promise<AddressData> {
     return await this.getOrFail<AddressData>(`/address/${address}`);
+  }
+
+  /**
+   * One page of an address's outputs (at most 50). Pass the returned `offset` as the
+   * next `skip`; an empty page means the end.
+   */
+  async getAddressOutputs(
+    address: string,
+    pagination?: Pagination,
+  ): Promise<PaginationResponse<AddressTxOut>> {
+    return await this.getOrFail<PaginationResponse<AddressTxOut>>(
+      `/address/${address}/outputs`,
+      { params: pagination || {} },
+    );
   }
 
   async getTransaction(txid: string): Promise<Transaction | undefined> {
@@ -150,8 +177,13 @@ export class TitanHttpClient {
     );
   }
 
-  async getMempoolTxids(): Promise<string[]> {
-    return await this.getOrFail<string[]>(`/mempool/txids`);
+  /** One page of mempool txids in txid byte order (at most 1000). */
+  async getMempoolTxids(
+    pagination?: Pagination,
+  ): Promise<PaginationResponse<string>> {
+    return await this.getOrFail<PaginationResponse<string>>(`/mempool/txids`, {
+      params: pagination || {},
+    });
   }
 
   async getMempoolEntry(txid: string): Promise<MempoolEntry | undefined> {
@@ -178,35 +210,53 @@ export class TitanHttpClient {
     return new Map(Object.entries(response.data));
   }
 
-  async getAllMempoolEntries(): Promise<Map<string, MempoolEntry>> {
-    const response = await this.http.get<Record<string, MempoolEntry>>(
-      '/mempool/entries/all',
+  /** One page of mempool entries in txid byte order (at most 50). */
+  async listMempoolEntries(
+    pagination?: Pagination,
+  ): Promise<PaginationResponse<MempoolTxEntry>> {
+    return await this.getOrFail<PaginationResponse<MempoolTxEntry>>(
+      '/mempool/entries',
+      { params: pagination || {} },
     );
-
-    return new Map(Object.entries(response.data));
   }
 
   async getSubscription(id: string): Promise<Subscription | undefined> {
-    return await this.get<Subscription>(`/subscription/${id}`);
+    return await this.get<Subscription>(
+      `/subscription/${id}`,
+      this.adminConfig(),
+    );
   }
 
   async listSubscriptions(): Promise<Subscription[]> {
-    return await this.getOrFail<Subscription[]>('/subscriptions');
+    return await this.getOrFail<Subscription[]>(
+      '/subscriptions',
+      this.adminConfig(),
+    );
   }
 
   async addSubscription(subscription: Subscription): Promise<Subscription> {
     const response = await this.http.post<Subscription>(
       '/subscription',
       subscription,
+      this.adminConfig(),
     );
     return response.data;
   }
 
   async deleteSubscription(id: string): Promise<void> {
-    const response = await this.http.delete(`/subscription/${id}`);
+    const response = await this.http.delete(
+      `/subscription/${id}`,
+      this.adminConfig(),
+    );
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Delete subscription failed: HTTP ${response.status}`);
     }
+  }
+
+  private adminConfig(): AxiosRequestConfig | undefined {
+    return this.adminToken
+      ? { headers: { Authorization: `Bearer ${this.adminToken}` } }
+      : undefined;
   }
 
   private async getOrFail<T>(

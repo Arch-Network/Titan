@@ -9,5 +9,7 @@ mod fetcher;
 mod index_updater;
 mod rollback;
 mod store_lock;
+#[cfg(test)]
+mod testing;
 mod transaction;
 mod transaction_update;

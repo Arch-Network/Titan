@@ -2,16 +2,18 @@ use {
     super::TransactionStore,
     crate::{
         bitcoin_rpc::BitcoinCoreRpcResultExt,
-        index::{Chain, StoreError},
+        index::{inscription::unversioned_leaf_script_from_witness, Chain, StoreError},
         models::{Lot, TransactionStateChange, TransactionStateChangeInput},
         util::IntoUsize,
+    },
+    arch_titan_types_core::{
+        Height, Rune, RuneAmount, RuneId, SerializedOutPoint, SpentStatus, TxOut,
     },
     bitcoin::{consensus::encode, OutPoint, Transaction},
     bitcoincore_rpc::{Client, RpcApi},
     ordinals::{Artifact, Edict, Runestone},
     rustc_hash::FxHashMap as HashMap,
     thiserror::Error,
-    arch_titan_types_core::{Height, Rune, RuneAmount, RuneId, SerializedOutPoint, SpentStatus, TxOut},
 };
 
 #[derive(Debug, Error)]
@@ -25,6 +27,14 @@ pub enum TransactionParserError {
 }
 
 type Result<T> = std::result::Result<T, TransactionParserError>;
+
+type ParsedRunes = (
+    Vec<HashMap<RuneId, Lot>>, // allocated runes per output
+    Vec<HashMap<RuneId, Lot>>, // allocated risky runes per output
+    Option<RuneAmount>,        // minted rune at transaction level
+    Option<(RuneId, Rune)>,    // etched rune, if any
+    HashMap<RuneId, Lot>,      // burned runes
+);
 
 pub struct TransactionParser<'client> {
     pub(super) client: &'client Client,
@@ -143,13 +153,7 @@ impl<'client> TransactionParser<'client> {
         prev_outputs: HashMap<SerializedOutPoint, TxOut>,
         tx_index: u32,
         tx: &Transaction,
-    ) -> Result<(
-        Vec<HashMap<RuneId, Lot>>, // allocated runes per output
-        Vec<HashMap<RuneId, Lot>>, // allocated risky runes per output
-        Option<RuneAmount>,        // minted rune at transaction level
-        Option<(RuneId, Rune)>,    // etched rune, if any
-        HashMap<RuneId, Lot>,      // burned runes
-    )> {
+    ) -> Result<ParsedRunes> {
         let artifact = Runestone::decipher(tx);
         let (mut unallocated, mut risky_unallocated) = self.unallocated(tx, prev_outputs)?;
 
@@ -280,7 +284,7 @@ impl<'client> TransactionParser<'client> {
     fn allocate_edicts(
         &mut self,
         tx: &Transaction,
-        allocated: &mut Vec<HashMap<RuneId, Lot>>,
+        allocated: &mut [HashMap<RuneId, Lot>],
         balance: &mut Lot,
         id: RuneId,
         amount: Lot,
@@ -337,7 +341,7 @@ impl<'client> TransactionParser<'client> {
     fn allocate_remaining_in_pointer(
         &mut self,
         unallocated: &mut HashMap<RuneId, Lot>,
-        allocated: &mut Vec<HashMap<RuneId, Lot>>,
+        allocated: &mut [HashMap<RuneId, Lot>],
         vout: usize,
     ) {
         for (id, balance) in unallocated {
@@ -391,10 +395,10 @@ impl<'client> TransactionParser<'client> {
             }
             rune
         } else {
-            Rune::reserved(self.height.into(), tx_index)
+            Rune::reserved(self.height, tx_index)
         };
 
-        let rune_id = RuneId::new(self.height.into(), tx_index);
+        let rune_id = RuneId::new(self.height, tx_index);
 
         Ok(Some((rune_id, rune)))
     }
@@ -411,7 +415,7 @@ impl<'client> TransactionParser<'client> {
             }
         };
 
-        let Ok(amount) = rune_entry.mintable(self.height.into()) else {
+        let Ok(amount) = rune_entry.mintable(self.height) else {
             return Ok(None);
         };
 
@@ -424,45 +428,14 @@ impl<'client> TransactionParser<'client> {
         tx: &Transaction,
         rune: Rune,
     ) -> Result<bool> {
-        let commitment = rune.commitment();
-
-        for input in &tx.input {
-            // extracting a tapscript does not indicate that the input being spent
-            // was actually a taproot output. this is checked below, when we load the
-            // output's entry from the database
-            let Some(tapscript) = input.witness.tapscript() else {
-                continue;
-            };
-
-            for instruction in tapscript.instructions() {
-                // ignore errors, since the extracted script may not be valid
-                let Ok(instruction) = instruction else {
-                    break;
-                };
-
-                let Some(pushbytes) = instruction.push_bytes() else {
-                    continue;
-                };
-
-                if pushbytes.as_bytes() != commitment {
-                    continue;
+        tx_commits_to_rune_with(tx, rune, |outpoint| {
+            match self.validate_commit_transaction_with_cache(store, outpoint) {
+                Err(TransactionParserError::Store(StoreError::NotFound(_))) => {
+                    self.validate_commit_transaction(outpoint)
                 }
-
-                match self.validate_commit_transaction_with_cache(store, input.previous_output) {
-                    Ok(true) => return Ok(true),
-                    Ok(false) => continue,
-                    Err(e) => {
-                        if matches!(e, TransactionParserError::Store(StoreError::NotFound(_))) {
-                            return self.validate_commit_transaction(input.previous_output);
-                        } else {
-                            return Err(e.into());
-                        }
-                    }
-                }
+                result => result,
             }
-        }
-
-        Ok(false)
+        })
     }
 
     fn validate_commit_transaction_with_cache(
@@ -563,5 +536,128 @@ impl<'client> TransactionParser<'client> {
         let tx_out_map = store.get_tx_outs(&outpoints)?;
 
         Ok(tx_out_map)
+    }
+}
+
+/// Scans `tx` for a tapscript push of `rune`'s commitment, mirroring ord. Every input whose leaf
+/// script contains the commitment is checked with `validate_commit`; a failed validation
+/// (`Ok(false)`) moves on to the remaining instructions and inputs, while errors propagate.
+fn tx_commits_to_rune_with(
+    tx: &Transaction,
+    rune: Rune,
+    mut validate_commit: impl FnMut(OutPoint) -> Result<bool>,
+) -> Result<bool> {
+    let commitment = rune.commitment();
+
+    for input in &tx.input {
+        // extracting a tapscript does not indicate that the input being spent
+        // was actually a taproot output. this is checked below, when we load the
+        // output's entry from the database
+        let Some(tapscript) = unversioned_leaf_script_from_witness(&input.witness) else {
+            continue;
+        };
+
+        for instruction in tapscript.instructions() {
+            // ignore errors, since the extracted script may not be valid
+            let Ok(instruction) = instruction else {
+                break;
+            };
+
+            let Some(pushbytes) = instruction.push_bytes() else {
+                continue;
+            };
+
+            if pushbytes.as_bytes() != commitment {
+                continue;
+            }
+
+            if validate_commit(input.previous_output)? {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        bitcoin::{
+            absolute::LockTime, hashes::Hash, script, transaction::Version, ScriptBuf, Sequence,
+            TxIn, Txid, Witness,
+        },
+    };
+
+    fn commit_input(vout: u32, rune: Rune) -> TxIn {
+        let leaf_script = script::Builder::new()
+            .push_slice(<&script::PushBytes>::try_from(rune.commitment().as_slice()).unwrap())
+            .push_opcode(bitcoin::opcodes::all::OP_DROP)
+            .into_script();
+        TxIn {
+            previous_output: OutPoint::new(Txid::all_zeros(), vout),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[leaf_script.into_bytes(), vec![0xc0; 33]]),
+        }
+    }
+
+    fn etching_tx(rune: Rune) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![commit_input(0, rune), commit_input(1, rune)],
+            output: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn commitment_scan_continues_past_failed_validation() {
+        let rune = Rune(1_000_000_000_000_000);
+        let tx = etching_tx(rune);
+        let mut checked = Vec::new();
+
+        let commits = tx_commits_to_rune_with(&tx, rune, |outpoint| {
+            checked.push(outpoint.vout);
+            Ok(outpoint.vout == 1)
+        })
+        .unwrap();
+
+        assert!(commits);
+        assert_eq!(checked, vec![0, 1]);
+    }
+
+    #[test]
+    fn commitment_scan_fails_when_no_input_validates() {
+        let rune = Rune(1_000_000_000_000_000);
+        let tx = etching_tx(rune);
+
+        assert!(!tx_commits_to_rune_with(&tx, rune, |_| Ok(false)).unwrap());
+    }
+
+    #[test]
+    fn commitment_scan_propagates_validation_errors() {
+        let rune = Rune(1_000_000_000_000_000);
+        let tx = etching_tx(rune);
+
+        let result = tx_commits_to_rune_with(&tx, rune, |_| {
+            Err(TransactionParserError::Store(StoreError::NotFound(
+                "commit tx".to_string(),
+            )))
+        });
+
+        assert!(matches!(
+            result,
+            Err(TransactionParserError::Store(StoreError::NotFound(_)))
+        ));
+    }
+
+    #[test]
+    fn commitment_scan_ignores_other_runes() {
+        let rune = Rune(1_000_000_000_000_000);
+        let tx = etching_tx(Rune(rune.n() + 1));
+
+        assert!(!tx_commits_to_rune_with(&tx, rune, |_| Ok(true)).unwrap());
     }
 }

@@ -9,17 +9,22 @@ use {
             metrics::Metrics,
             store::Store,
             updater::{
-                cache::{BlockCache, BlockCacheSettings, MempoolCache, MempoolCacheSettings},
+                cache::{
+                    BgWriteError, BlockCache, BlockCacheSettings, MempoolCache,
+                    MempoolCacheSettings,
+                },
                 events::Events,
-                transaction::{TransactionParser, TransactionUpdater},
+                transaction::{TransactionParser, TransactionUpdater, TxContext},
             },
             Chain, Settings, StoreError,
         },
-        models::{BlockId, RuneEntry},
+        models::{BatchUpdate, BlockId, RuneEntry},
     },
+    arch_titan_types_core::{Block, Event, MempoolEntry, RuneId, SerializedTxid},
+    arch_titan_types_core::{Rune, SpacedRune},
     bitcoin::{
         constants::SUBSIDY_HALVING_INTERVAL, hex::HexToArrayError, Block as BitcoinBlock,
-        Transaction,
+        BlockHash, Transaction,
     },
     bitcoincore_rpc::{
         json::{GetBlockchainInfoResult, GetMempoolEntryResult},
@@ -35,24 +40,25 @@ use {
         fmt::{self, Display, Formatter},
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, Mutex, RwLock,
+            Arc, Mutex, PoisonError, RwLock,
         },
-        time::{SystemTime, UNIX_EPOCH},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     },
     store_lock::StoreWithLock,
     thiserror::Error,
-    arch_titan_types_core::{Block, Event, MempoolEntry, RuneId, SerializedTxid},
-    arch_titan_types_core::{Rune, SpacedRune},
     tokio::sync::mpsc::{error::SendError, Sender},
     tracing::{debug, error, info, warn},
 };
 
 #[derive(Debug, Error)]
 pub enum ReorgError {
-    Recoverable { height: u64, depth: u64 },
+    /// `depth` blocks below block count `height` were reverted.
+    Recoverable {
+        height: u64,
+        depth: u64,
+    },
     Unrecoverable,
-    StoreError(#[from] StoreError),
-    RPCError(#[from] bitcoincore_rpc::Error),
 }
 
 impl Display for ReorgError {
@@ -62,8 +68,6 @@ impl Display for ReorgError {
                 write!(f, "{depth} block deep reorg detected at height {height}")
             }
             Self::Unrecoverable => write!(f, "unrecoverable reorg detected"),
-            Self::StoreError(e) => write!(f, "store error: {e}"),
-            Self::RPCError(e) => write!(f, "RPC error: {e}"),
         }
     }
 }
@@ -83,7 +87,7 @@ pub enum UpdaterError {
     #[error("rollback error {0}")]
     Rollback(#[from] RollbackError),
     #[error("rune parser error {0}")]
-    RuneParser(#[from] TransactionParserError),
+    RuneParser(TransactionParserError),
     #[error("txid error {0}")]
     Txid(#[from] HexToArrayError),
     #[error("mempool error {0}")]
@@ -91,14 +95,62 @@ pub enum UpdaterError {
     #[error("mutex error")]
     Mutex,
     #[error("event sender error {0}")]
-    EventSender(#[from] SendError<Event>),
+    EventSender(#[from] Box<SendError<Event>>),
     #[error("invalid main chain tip")]
     InvalidMainChainTip,
     #[error("bitcoin rpc pool error {0}")]
     BitcoinRpcPool(#[from] RpcClientPoolError),
+    #[error("{0}")]
+    BackgroundWrite(#[from] BgWriteError),
 }
 
-type Result<T> = std::result::Result<T, UpdaterError>;
+impl From<SendError<Event>> for UpdaterError {
+    fn from(error: SendError<Event>) -> Self {
+        Self::EventSender(Box::new(error))
+    }
+}
+
+impl From<TransactionParserError> for UpdaterError {
+    fn from(error: TransactionParserError) -> Self {
+        match error {
+            // Retryable like any other RPC failure (see `Index::index`).
+            TransactionParserError::BitcoinRpc(e) => Self::BitcoinRpc(e),
+            other => Self::RuneParser(other),
+        }
+    }
+}
+
+type Result<T, E = UpdaterError> = std::result::Result<T, E>;
+
+/// Where the indexed tip stands relative to bitcoind's best chain.
+#[derive(Debug, PartialEq)]
+enum IndexTip {
+    /// Same chain, same height.
+    Synced,
+    /// Same chain, bitcoind has more blocks.
+    Behind,
+    /// Bitcoind's best block is an indexed block below the tip: it is behind the
+    /// index on the same chain (restarted, still syncing, invalidated blocks...).
+    NodeBehind,
+    /// The top `depth` indexed blocks are not on bitcoind's best chain.
+    Reorged { depth: u64 },
+}
+
+/// Removes the txid from `pre_index_submitted_txs` when dropped, so mempool
+/// indexing stops skipping it however broadcast indexing ends.
+struct PreIndexedTx<'a> {
+    txs: &'a RwLock<HashSet<SerializedTxid>>,
+    txid: SerializedTxid,
+}
+
+impl Drop for PreIndexedTx<'_> {
+    fn drop(&mut self) {
+        self.txs
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.txid);
+    }
+}
 
 pub struct Updater {
     db: Arc<StoreWithLock>,
@@ -153,30 +205,39 @@ impl Updater {
         self.is_at_tip.load(Ordering::Relaxed)
     }
 
-    fn is_chain_synced(
+    /// Compare the indexed tip with bitcoind's best chain.
+    fn check_index_tip(
         &self,
         cache: &mut BlockCache,
         chain_info: &GetBlockchainInfoResult,
-    ) -> Result<bool> {
-        if cache.get_block_height_tip() != chain_info.blocks {
-            return Ok(false);
-        }
+        client: &Client,
+    ) -> Result<IndexTip> {
+        let Some(tip_height) = cache.get_block_count().checked_sub(1) else {
+            // Nothing indexed yet.
+            return Ok(IndexTip::Behind);
+        };
 
-        // Add exception when indexing genesis block
-        if cache.get_block_height_tip() == 0 && chain_info.blocks == 0 {
+        index_tip(
+            tip_height,
+            chain_info.blocks,
+            self.settings.max_recoverable_reorg_depth(),
+            |height| Ok(cache.get_block_hash(height)?),
+            |height| Ok(client.get_block_hash(height)?),
+        )
+    }
+
+    /// Whether `block` builds on the indexed tip.
+    fn extends_index_tip(&self, block: &BitcoinBlock, cache: &mut BlockCache) -> Result<bool> {
+        let Some(tip_height) = cache.get_block_count().checked_sub(1) else {
+            return Ok(true);
+        };
+
+        // Regtest doesn't index its genesis block.
+        if tip_height == 0 && self.settings.chain == Chain::Regtest {
             return Ok(true);
         }
 
-        match cache.get_block_hash(chain_info.blocks) {
-            Ok(block_hash) => {
-                // Compare hashes to detect reorgs
-                Ok(block_hash == chain_info.best_block_hash)
-            }
-            Err(_) => {
-                // If we can't get the hash, we're not synced
-                Ok(false)
-            }
-        }
+        Ok(cache.get_block_hash(tip_height)? == block.header.prev_blockhash)
     }
 
     fn is_already_at_tip(
@@ -230,8 +291,7 @@ impl Updater {
     pub fn update_to_tip(&self) -> Result<()> {
         debug!("Updating to tip");
 
-        let rpc_client = self.bitcoin_rpc_pool.get()?;
-        let chain_info = rpc_client.get_blockchain_info()?;
+        let chain_info = self.bitcoin_rpc_pool.get()?.get_blockchain_info()?;
 
         if self.is_already_at_tip(&chain_info)? {
             self.mark_as_at_tip();
@@ -257,9 +317,33 @@ impl Updater {
         let mut events = Events::new();
 
         let mut indexing_first_block = true;
+        let mut synced = false;
 
-        // Fetch new blocks if needed.
-        while !self.is_chain_synced(&mut cache, &chain_info)? {
+        while !self.shutdown_flag.load(Ordering::SeqCst) {
+            match self.check_index_tip(&mut cache, &chain_info, &bitcoin_block_client)? {
+                IndexTip::Synced => {
+                    synced = true;
+                    break;
+                }
+                IndexTip::Behind => (),
+                IndexTip::NodeBehind => {
+                    // Nothing to fetch and nothing to revert: wait for bitcoind to
+                    // catch up or switch chains.
+                    self.mark_as_not_at_tip();
+                    warn!(
+                        "Bitcoin node is at height {}, below the indexed tip {}; waiting",
+                        chain_info.blocks,
+                        cache.get_block_height_tip()
+                    );
+                    thread::sleep(Duration::from_millis(self.settings.main_loop_interval));
+                    chain_info = bitcoin_block_client.get_blockchain_info()?;
+                    continue;
+                }
+                IndexTip::Reorged { depth } => {
+                    return self.handle_reorg(cache, &mut events, depth);
+                }
+            }
+
             self.mark_as_not_at_tip();
 
             let progress_bar =
@@ -273,8 +357,6 @@ impl Updater {
                 chain_info.blocks + 1,
                 self.shutdown_flag.clone(),
             )?;
-
-            let rpc_client = self.bitcoin_rpc_pool.get()?;
 
             while let Ok(block) = rx.recv() {
                 // We have consumed a block from the final channel, reflect that in the stats
@@ -290,38 +372,20 @@ impl Updater {
                     break;
                 }
 
-                // Always check for potential reorgs before indexing the next block.
-                match self.detect_reorg(
-                    &block,
-                    cache.get_block_count(),
-                    &mut cache,
-                    &rpc_client,
-                    self.settings.max_recoverable_reorg_depth(),
-                ) {
-                    Ok(()) => (),
-                    Err(ReorgError::Recoverable { height, depth }) => {
-                        // Persist any in-memory updates so `handle_reorg` can cleanly roll
-                        // back blocks that might still be sitting in the cache and have not
-                        // been flushed to RocksDB yet.
-                        cache.flush_sync()?;
-
-                        self.handle_reorg(height, depth)?;
-                        if let Some(sender) = &self.sender {
-                            if let Err(e) = sender.blocking_send(Event::Reorg { height, depth }) {
-                                error!("Failed to send reorg event: {:?}", e);
-                            }
-                        }
-                        return Err(ReorgError::Recoverable { height, depth }.into());
-                    }
-                    Err(e) => {
-                        return Err(e.into());
-                    }
+                // bitcoind's chain changed since the fetch started: re-check the tip
+                // (and revert to the common ancestor if needed) before indexing more.
+                if !self.extends_index_tip(&block, &mut cache)? {
+                    info!(
+                        "Block {} does not extend the indexed tip, re-checking the chain",
+                        block.header.block_hash()
+                    );
+                    break;
                 }
 
                 let block = self.index_block(
                     block,
-                    cache.get_block_count() as u64,
-                    &rpc_client,
+                    cache.get_block_count(),
+                    &bitcoin_block_client,
                     &mut cache,
                     &mut events,
                 )?;
@@ -350,7 +414,9 @@ impl Updater {
                 indexing_first_block = false;
                 progress_bar.inc(1);
 
-                if chain_info.blocks - cache.get_block_height_tip()
+                if chain_info
+                    .blocks
+                    .saturating_sub(cache.get_block_height_tip())
                     > self.settings.max_recoverable_reorg_depth()
                 {
                     // clear notifications.
@@ -358,14 +424,12 @@ impl Updater {
                 }
             }
 
-            if self.shutdown_flag.load(Ordering::SeqCst) {
-                info!("Updater received shutdown signal, stopping...");
-                break;
-            }
-
-            info!("Synced to tip {}", chain_info.blocks);
-            chain_info = bitcoin_block_client.get_blockchain_info()?;
             progress_bar.finish_and_clear();
+            chain_info = bitcoin_block_client.get_blockchain_info()?;
+        }
+
+        if self.shutdown_flag.load(Ordering::SeqCst) {
+            info!("Updater received shutdown signal, stopping...");
         }
 
         if !indexing_first_block {
@@ -378,7 +442,14 @@ impl Updater {
             self.emit_events_after_persist(&mut cache, &mut events)?;
         }
 
-        self.mark_as_at_tip();
+        // Wait until everything is persisted: a failed background write surfaces
+        // here, and the tip is only marked once it is on disk.
+        cache.close()?;
+
+        if synced {
+            info!("Synced to tip {}", chain_info.blocks);
+            self.mark_as_at_tip();
+        }
 
         Ok(())
     }
@@ -388,7 +459,12 @@ impl Updater {
         let mut pending_events = events.take_all();
         let sender_clone = self.sender.clone();
         std::thread::spawn(move || {
-            let _ = rx.recv();
+            if rx.recv().is_err() {
+                // The batch was not persisted; the next flush or close reports why.
+                error!("emit_events_after_persist: batch not persisted, dropping its events");
+                return;
+            }
+
             info!("emit_events_after_persist: events emitted");
             if let Some(sender) = sender_clone {
                 for event in pending_events.drain(..) {
@@ -411,7 +487,10 @@ impl Updater {
         let client = self.bitcoin_rpc_pool.get()?;
 
         // Get current mempool transactions
-        let lock = self.broadcast_lock.lock().unwrap();
+        let lock = self
+            .broadcast_lock
+            .lock()
+            .map_err(|_| UpdaterError::Mutex)?;
         let current_mempool = {
             let current_mempool = client.get_raw_mempool_verbose()?;
             current_mempool
@@ -434,7 +513,7 @@ impl Updater {
             Vec<(SerializedTxid, MempoolEntry)>,
         ) = current_mempool
             .iter()
-            .filter(|(txid, _)| !stored_mempool.contains_key(&txid))
+            .filter(|(txid, _)| !stored_mempool.contains_key(txid))
             .map(|(txid, mempool_entry)| (*txid, (*txid, MempoolEntry::from(mempool_entry))))
             .unzip();
 
@@ -444,6 +523,14 @@ impl Updater {
             .filter(|txid| !current_mempool.contains_key(txid))
             .cloned()
             .collect();
+
+        // Revert the transactions that left the mempool before indexing the new ones:
+        // an RBF replacement spends the outputs of the transaction it replaced, and
+        // reverting that one afterwards would mark them unspent again.
+        let removed_len = removed_txs.len();
+        if removed_len > 0 {
+            self.remove_txs(&removed_txs, true)?;
+        }
 
         // Index new transactions
         let new_txs_len = new_txs.len();
@@ -475,6 +562,7 @@ impl Updater {
                 let mempool_entry = current_mempool.get(txid).unwrap();
 
                 self.index_tx(
+                    &client,
                     txid,
                     tx,
                     MempoolEntry::from(mempool_entry),
@@ -494,11 +582,6 @@ impl Updater {
             if !self.shutdown_flag.load(Ordering::SeqCst) {
                 error!("Failed to send events: {:?}", e);
             }
-        }
-
-        let removed_len = removed_txs.len();
-        if removed_txs.len() > 0 {
-            self.remove_txs(&removed_txs, true)?;
         }
 
         if new_txs_len > 0 || removed_len > 0 {
@@ -573,7 +656,7 @@ impl Updater {
 
     fn choose_mempool_transactions_to_index(
         &self,
-        new_txs: &Vec<SerializedTxid>,
+        new_txs: &[SerializedTxid],
     ) -> Result<HashMap<SerializedTxid, Transaction>> {
         // Filter out pre-indexed transactions
         let new_txs = {
@@ -640,9 +723,9 @@ impl Updater {
             .start_timer();
 
         let mut transaction_parser =
-            TransactionParser::new(&rpc_client, self.settings.chain, height, false)?;
+            TransactionParser::new(rpc_client, self.settings.chain, height, false)?;
 
-        let block_header: bitcoin::block::Header = bitcoin_block.header.clone();
+        let block_header: bitcoin::block::Header = bitcoin_block.header;
         let block_height = height;
 
         let _block_tx_timer = self
@@ -654,38 +737,39 @@ impl Updater {
 
         let mut block = Block::empty_block(height, bitcoin_block.header);
 
+        for (i, tx) in bitcoin_block.txdata.iter().enumerate() {
+            let txid = tx.compute_txid().into();
+            let result = transaction_parser.parse(cache, u32::try_from(i).unwrap(), tx)?;
+
+            debug!("Indexing tx {} in block {}", txid, block_height);
+            transaction_updater.save(
+                cache,
+                events,
+                TxContext {
+                    block_time: block_header.time,
+                    block_id: Some(BlockId {
+                        hash: bitcoin_block.header.block_hash(),
+                        height: block_height,
+                    }),
+                    txid,
+                    transaction: &bitcoin_block.txdata[i],
+                },
+                &result,
+            )?;
+            block.tx_ids.push(txid);
+            if let Some((id, ..)) = result.etched {
+                block.etched_runes.push(id);
+            }
+        }
+
+        // Only a fully indexed block counts: on error the block is indexed again.
         let mut transaction_update = self
             .transaction_update
             .write()
             .map_err(|_| UpdaterError::Mutex)?;
 
-        for (i, tx) in bitcoin_block.txdata.iter().enumerate() {
-            let txid = tx.compute_txid().into();
-            match transaction_parser.parse(cache, u32::try_from(i).unwrap(), tx) {
-                Ok(result) => {
-                    debug!("Indexing tx {} in block {}", txid, block_height);
-                    transaction_updater.save(
-                        cache,
-                        events,
-                        block_header.time,
-                        Some(BlockId {
-                            hash: bitcoin_block.header.block_hash(),
-                            height: block_height,
-                        }),
-                        txid,
-                        &bitcoin_block.txdata[i],
-                        &result,
-                    )?;
-                    block.tx_ids.push(txid);
-                    transaction_update.add_block_tx(txid);
-                    if let Some((id, ..)) = result.etched {
-                        block.etched_runes.push(id);
-                    }
-                }
-                Err(e) => {
-                    panic!("Failed to index transaction {}: {}", txid, e);
-                }
-            }
+        for txid in &block.tx_ids {
+            transaction_update.add_block_tx(*txid);
         }
 
         Ok(block)
@@ -709,18 +793,44 @@ impl Updater {
         Ok(())
     }
 
+    /// Index a transaction this node just broadcast, with the broadcasting request's
+    /// `rpc_client`: getting one from the pool under `broadcast_lock` could deadlock
+    /// once concurrent broadcasts hold every pooled client.
     pub fn index_new_submitted_tx(
         &self,
+        rpc_client: &Client,
         txid: &SerializedTxid,
         tx: &Transaction,
         mempool_entry: MempoolEntry,
     ) -> Result<()> {
-        let mut cache =
-            MempoolCache::new(self.db.clone(), MempoolCacheSettings::new(&self.settings))?;
+        let _pre_indexed = PreIndexedTx {
+            txs: &self.pre_index_submitted_txs,
+            txid: *txid,
+        };
+
         let mut events = Events::new();
 
-        let _lock = self.broadcast_lock.lock().unwrap();
-        if self.index_tx(txid, tx, mempool_entry.clone(), &mut cache, &mut events)? {
+        {
+            let _lock = self
+                .broadcast_lock
+                .lock()
+                .map_err(|_| UpdaterError::Mutex)?;
+
+            let mut cache =
+                MempoolCache::new(self.db.clone(), MempoolCacheSettings::new(&self.settings))?;
+
+            let indexed = self.index_tx(
+                rpc_client,
+                txid,
+                tx,
+                mempool_entry.clone(),
+                &mut cache,
+                &mut events,
+            )?;
+            if !indexed {
+                return Ok(());
+            }
+
             events.add_event(Event::TransactionSubmitted {
                 txid: *txid,
                 entry: mempool_entry,
@@ -731,14 +841,15 @@ impl Updater {
             }
 
             cache.flush()?;
-            if let Err(e) = events.send_events(&self.sender) {
-                if !self.shutdown_flag.load(Ordering::SeqCst) {
-                    error!("Failed to send events: {:?}", e);
-                }
+        }
+
+        // Deliver outside `broadcast_lock` so a slow subscriber can't stall mempool indexing.
+        if let Err(e) = events.send_events(&self.sender) {
+            if !self.shutdown_flag.load(Ordering::SeqCst) {
+                error!("Failed to send events: {:?}", e);
             }
         }
 
-        self.remove_pre_index_new_submitted_transaction(&txid)?;
         Ok(())
     }
 
@@ -750,8 +861,11 @@ impl Updater {
         Ok(())
     }
 
+    /// The caller supplies `rpc_client`, so no pool client is taken while holding
+    /// `broadcast_lock` (see `index_new_submitted_tx`).
     fn index_tx(
         &self,
+        rpc_client: &Client,
         txid: &SerializedTxid,
         tx: &Transaction,
         mempool_entry: MempoolEntry,
@@ -771,22 +885,31 @@ impl Updater {
             .unwrap()
             .as_secs();
 
-        let rpc_client = self.bitcoin_rpc_pool.get()?;
         let mut transaction_parser =
-            TransactionParser::new(&rpc_client, self.settings.chain, height, true)?;
+            TransactionParser::new(rpc_client, self.settings.chain, height, true)?;
 
         let result = transaction_parser.parse(cache, 0, tx)?;
         debug!("Indexing tx {}", txid);
 
         let mut transaction_updater = TransactionUpdater::new(self.settings.clone().into(), true)?;
-        transaction_updater.save(cache, events, now as u32, None, *txid, tx, &result)?;
+        transaction_updater.save(
+            cache,
+            events,
+            TxContext {
+                block_time: now as u32,
+                block_id: None,
+                txid: *txid,
+                transaction: tx,
+            },
+            &result,
+        )?;
 
         cache.set_mempool_tx(*txid, mempool_entry);
 
         Ok(true)
     }
 
-    fn remove_txs(&self, txids: &Vec<SerializedTxid>, mempool: bool) -> Result<()> {
+    fn remove_txs(&self, txids: &[SerializedTxid], mempool: bool) -> Result<()> {
         let db = self.db.write();
         let mut rollback_updater = Rollback::new(&db, self.settings.clone().into(), mempool)?;
         rollback_updater.revert_transactions(txids)?;
@@ -794,8 +917,8 @@ impl Updater {
     }
 
     fn open_progress_bar(&self, current_height: u64, total_height: u64) -> ProgressBar {
-        let progress_bar: ProgressBar = ProgressBar::new(total_height.into());
-        progress_bar.set_position(current_height.into());
+        let progress_bar: ProgressBar = ProgressBar::new(total_height);
+        progress_bar.set_position(current_height);
         progress_bar.set_style(
             ProgressStyle::with_template("[indexing blocks] {wide_bar} {pos}/{len}").unwrap(),
         );
@@ -803,84 +926,53 @@ impl Updater {
         progress_bar
     }
 
-    fn detect_reorg(
-        &self,
-        block: &BitcoinBlock,
-        height: u64,
-        cache: &mut BlockCache,
-        client: &Client,
-        max_recoverable_reorg_depth: u64,
-    ) -> std::result::Result<(), ReorgError> {
-        if height == 0 {
-            return Ok(());
-        }
-
-        let bitcoind_prev_blockhash = block.header.prev_blockhash;
-
-        let prev_height = height.checked_sub(1);
-
-        let Some(prev_height) = prev_height else {
-            return Ok(());
-        };
-
-        // Regtest has no genesis block, so we don't need to check for reorgs.
-        if prev_height == 0 && self.settings.chain == Chain::Regtest {
-            return Ok(());
-        }
-
-        let index_prev_blockhash = cache.get_block_hash(prev_height)?;
-
-        if index_prev_blockhash == bitcoind_prev_blockhash {
-            return Ok(());
-        }
-
-        // Walk back up to max_recoverable_reorg_depth looking for a common ancestor.
-        for depth in 1..max_recoverable_reorg_depth {
-            let height_to_check = height.saturating_sub(depth);
-
-            let index_block_hash = cache.get_block_hash(height_to_check)?;
-
-            let bitcoind_block_hash = client.get_block_hash(height_to_check)?;
-
-            if index_block_hash == bitcoind_block_hash {
-                info!("Reorg until height {}. Depth: {}", height_to_check, depth);
-                return Err(ReorgError::Recoverable { height, depth });
-            }
-        }
-
-        Err(ReorgError::Unrecoverable)
-    }
-
-    fn handle_reorg(&self, height: u64, depth: u64) -> Result<()> {
+    /// Revert the top `depth` indexed blocks, which are no longer on bitcoind's best
+    /// chain, and return `ReorgError::Recoverable` so the sync restarts from the
+    /// common ancestor with fresh caches.
+    fn handle_reorg(&self, mut cache: BlockCache, events: &mut Events, depth: u64) -> Result<()> {
         // we're not at tip anymore.
         self.mark_as_not_at_tip();
 
+        // Persist and announce what was indexed so far: the revert works on the store
+        // alone, and subscribers must have seen every block a Reorg event rolls back.
+        if self.settings.index_addresses {
+            cache.add_address_events(events, self.settings.chain);
+        }
+        let block_count = cache.get_block_count();
+        cache.flush_sync()?;
+        cache.close()?;
+
+        if let Err(e) = events.send_events(&self.sender) {
+            error!("Failed to send events before reorg: {:?}", e);
+        }
+
         info!(
             "Reorg detected at height {}, rolling back {} blocks",
-            height, depth
+            block_count, depth
         );
 
-        {
-            let db = self.db.write();
-
-            // Roll back the persisted block count.
-            // `height` refers to the height of the *next* block that was about to be indexed (i.e. equal to
-            // the current block count). Since that block has not been written to the database yet, we only
-            // want to keep blocks strictly below `height`. Therefore, after reverting `depth` blocks, the
-            // new block count must be `height - depth` (the last retained height + 1).
-            db.set_block_count(height - depth)?;
+        // Top-down, one block per write, each lowering the block count with it: if
+        // this stops halfway, the store is consistent and the next sync resumes.
+        for height in (block_count - depth..block_count).rev() {
+            let block = self.get_block_by_height(height)?;
+            self.revert_block(height, &block)?;
         }
 
-        // Find rolled back blocks and revert those txs.
-        // The block at `height` has not yet been stored, so begin reverting from `height - 1` down to
-        // `height - depth`, inclusive. This rolls back exactly `depth` blocks.
-        for i in 0..depth {
-            let block_height_rolled_back = height - 1 - i;
-            let block = self.get_block_by_height(block_height_rolled_back)?;
-            self.revert_block(block_height_rolled_back as u32, &block)?;
+        if let Some(sender) = &self.sender {
+            let event = Event::Reorg {
+                height: block_count,
+                depth,
+            };
+            if let Err(e) = sender.blocking_send(event) {
+                error!("Failed to send reorg event: {:?}", e);
+            }
         }
 
-        Ok(())
+        Err(ReorgError::Recoverable {
+            height: block_count,
+            depth,
+        }
+        .into())
     }
 
     fn get_block_by_height(&self, height: u64) -> Result<Block> {
@@ -890,12 +982,12 @@ impl Updater {
         Ok(block)
     }
 
-    fn revert_block(&self, height: u32, block: &Block) -> Result<()> {
-        let db = self.db.write();
-
-        let mut rollback_updater = Rollback::new(&db, self.settings.clone().into(), false)?;
-
-        rollback_updater.revert_transactions(&block.tx_ids)?;
+    fn revert_block(&self, height: u64, block: &Block) -> Result<()> {
+        {
+            let db = self.db.write();
+            let mut rollback_updater = Rollback::new(&db, self.settings.clone().into(), false)?;
+            rollback_updater.revert_block(height, block.header.block_hash(), &block.tx_ids)?;
+        }
 
         {
             let mut transaction_update = self
@@ -914,10 +1006,6 @@ impl Updater {
             block.header.block_hash(),
             block.tx_ids.len()
         );
-
-        // Delete block
-        db.delete_block(&block.header.block_hash())?;
-        db.delete_block_hash(height as u64)?;
 
         Ok(())
     }
@@ -964,7 +1052,7 @@ impl Updater {
                 let (_, not_exists) = {
                     let db = self.db.read();
                     db.partition_transactions_by_existence(
-                        &categorized.removed.into_iter().collect(),
+                        &categorized.removed.into_iter().collect::<Vec<_>>(),
                     )?
                 };
 
@@ -995,38 +1083,203 @@ impl Updater {
         Ok(())
     }
 
-    fn insert_genesis_rune(&self) -> Result<()> {
-        let rune = Rune(2055900680524219742);
+    /// On mainnet, seed a fresh index with the UNCOMMON•GOODS rune, as ord does when
+    /// it creates its database. Does nothing once anything was indexed.
+    pub fn insert_genesis_rune(&self) -> Result<()> {
+        if self.settings.chain != Chain::Mainnet {
+            return Ok(());
+        }
 
-        let id = RuneId::new(1, 0);
-        let etching = SerializedTxid::all_zeros();
-
-        let rune = RuneEntry {
-            block: id.block,
-            burned: 0,
-            divisibility: 0,
-            etching,
-            terms: Some(Terms {
-                amount: Some(1),
-                cap: Some(u128::MAX),
-                height: (
-                    Some((SUBSIDY_HALVING_INTERVAL * 4).into()),
-                    Some((SUBSIDY_HALVING_INTERVAL * 5).into()),
-                ),
-                offset: (None, None),
-            }),
-            mints: 0,
-            number: 0,
-            premine: 0,
-            spaced_rune: SpacedRune { rune, spacers: 128 },
-            symbol: Some('\u{29C9}'),
-            timestamp: 0,
-            turbo: true,
-            pending_burns: 0,
-            pending_mints: 0,
-            inscription_id: None,
-        };
+        let db = self.db.write();
+        if insert_genesis_rune(&**db)? {
+            info!("Inserted genesis rune UNCOMMON•GOODS (1:0)");
+        }
 
         Ok(())
+    }
+}
+
+/// Store ord's genesis rune 1:0 (UNCOMMON•GOODS, rune number 0) if nothing is
+/// indexed yet. Returns whether it was inserted.
+fn insert_genesis_rune(db: &dyn Store) -> Result<bool, StoreError> {
+    if db.get_block_count()? != 0 || db.get_runes_count()? != 0 {
+        return Ok(false);
+    }
+
+    let rune = Rune(2055900680524219742);
+    let id = RuneId::new(1, 0);
+
+    let entry = RuneEntry {
+        block: id.block,
+        burned: 0,
+        divisibility: 0,
+        etching: SerializedTxid::all_zeros(),
+        terms: Some(Terms {
+            amount: Some(1),
+            cap: Some(u128::MAX),
+            height: (
+                Some((SUBSIDY_HALVING_INTERVAL * 4).into()),
+                Some((SUBSIDY_HALVING_INTERVAL * 5).into()),
+            ),
+            offset: (None, None),
+        }),
+        mints: 0,
+        number: 0,
+        premine: 0,
+        spaced_rune: SpacedRune { rune, spacers: 128 },
+        symbol: Some('\u{29C9}'),
+        timestamp: 0,
+        turbo: true,
+        pending_burns: 0,
+        pending_mints: 0,
+        inscription_id: None,
+    };
+
+    // One block batch: the entry, its name and number mappings and the rune count
+    // are written together.
+    let mut update = BatchUpdate::new(1, 0, 0);
+    update.runes.insert(id, entry);
+    update.rune_ids.insert(rune.0, id);
+    update.rune_numbers.insert(0, id);
+    db.batch_update(&update, false)?;
+
+    Ok(true)
+}
+
+/// Where the index tip at `tip_height` stands relative to the node's best chain
+/// of height `node_height`. `index_hash` and `node_hash` give the block hash at a
+/// height in the index and in the node's best chain.
+fn index_tip(
+    tip_height: u64,
+    node_height: u64,
+    max_reorg_depth: u64,
+    mut index_hash: impl FnMut(u64) -> Result<BlockHash>,
+    mut node_hash: impl FnMut(u64) -> Result<BlockHash>,
+) -> Result<IndexTip> {
+    // The highest indexed block, at most `node_height`, that is also on the node's
+    // best chain. More than `max_reorg_depth` blocks below the tip it can't be
+    // reverted: older blocks are purged.
+    let lowest = tip_height.saturating_sub(max_reorg_depth);
+    let mut ancestor = tip_height.min(node_height);
+
+    // Every chain shares the genesis block, which regtest doesn't index.
+    while ancestor > 0 && index_hash(ancestor)? != node_hash(ancestor)? {
+        if ancestor <= lowest {
+            return Err(ReorgError::Unrecoverable.into());
+        }
+        ancestor -= 1;
+    }
+
+    Ok(if ancestor == tip_height {
+        if node_height > tip_height {
+            IndexTip::Behind
+        } else {
+            IndexTip::Synced
+        }
+    } else if ancestor == node_height {
+        IndexTip::NodeBehind
+    } else {
+        IndexTip::Reorged {
+            depth: tip_height - ancestor,
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, crate::index::updater::testing::TempStore, bitcoin::hashes::Hash};
+
+    fn hash(chain: u8, height: u64) -> BlockHash {
+        let mut bytes = [chain; 32];
+        bytes[..8].copy_from_slice(&height.to_le_bytes());
+        BlockHash::from_byte_array(bytes)
+    }
+
+    /// The index has blocks 0..=`tip` of chain 0. The node's best chain has
+    /// `node_height + 1` blocks and leaves chain 0 above `fork_height`.
+    fn tip(tip: u64, node_height: u64, fork_height: u64) -> Result<IndexTip> {
+        index_tip(
+            tip,
+            node_height,
+            10,
+            |height| {
+                assert!(height <= tip, "index has no block {height}");
+                Ok(hash(0, height))
+            },
+            |height| {
+                assert!(height <= node_height, "node has no block {height}");
+                Ok(hash(if height > fork_height { 1 } else { 0 }, height))
+            },
+        )
+    }
+
+    #[test]
+    fn index_tip_on_node_chain() {
+        assert_eq!(tip(100, 100, u64::MAX).unwrap(), IndexTip::Synced);
+        assert_eq!(tip(100, 105, u64::MAX).unwrap(), IndexTip::Behind);
+        assert_eq!(tip(100, 90, u64::MAX).unwrap(), IndexTip::NodeBehind);
+    }
+
+    #[test]
+    fn reorg_depth_counts_blocks_above_common_ancestor() {
+        // Same height, different tip: only the tip is reverted, block 99 is kept.
+        assert_eq!(tip(100, 100, 99).unwrap(), IndexTip::Reorged { depth: 1 });
+        // The node's chain is longer and forked below the tip.
+        assert_eq!(tip(100, 103, 97).unwrap(), IndexTip::Reorged { depth: 3 });
+        // The node is behind on another branch: revert down to the fork.
+        assert_eq!(tip(100, 98, 95).unwrap(), IndexTip::Reorged { depth: 5 });
+    }
+
+    #[test]
+    fn reorg_deeper_than_max_depth_is_unrecoverable() {
+        // Exactly max depth: block 90 is still retained and the common ancestor.
+        assert_eq!(tip(100, 100, 90).unwrap(), IndexTip::Reorged { depth: 10 });
+        assert!(matches!(
+            tip(100, 100, 89),
+            Err(UpdaterError::BitcoinReorg(ReorgError::Unrecoverable))
+        ));
+    }
+
+    #[test]
+    fn genesis_is_always_a_common_ancestor() {
+        assert_eq!(tip(3, 3, 0).unwrap(), IndexTip::Reorged { depth: 3 });
+        assert_eq!(tip(0, 0, 0).unwrap(), IndexTip::Synced);
+    }
+
+    #[test]
+    fn genesis_rune_is_inserted_once_into_a_fresh_index() {
+        let store = TempStore::new();
+        let db = store.db();
+
+        assert!(insert_genesis_rune(db).unwrap());
+        assert!(!insert_genesis_rune(db).unwrap());
+
+        let id = RuneId::new(1, 0);
+        let rune = Rune(2055900680524219742);
+        assert_eq!(Store::get_runes_count(db).unwrap(), 1);
+        assert_eq!(Store::get_rune_id(db, &rune).unwrap(), id);
+        assert_eq!(db.get_rune_id_by_number(0).unwrap(), id);
+
+        let entry = Store::get_rune(db, &id).unwrap();
+        assert_eq!(entry.spaced_rune.to_string(), "UNCOMMON•GOODS");
+        assert_eq!(entry.symbol, Some('⧉'));
+        assert_eq!((entry.block, entry.number, entry.mints), (1, 0, 0));
+        assert!(entry.turbo);
+        let terms = entry.terms.unwrap();
+        assert_eq!(terms.amount, Some(1));
+        assert_eq!(terms.cap, Some(u128::MAX));
+        assert_eq!(terms.height, (Some(840_000), Some(1_050_000)));
+        assert_eq!(entry.mintable(840_000), Ok(1));
+    }
+
+    #[test]
+    fn genesis_rune_is_not_inserted_after_indexing_started() {
+        let store = TempStore::new();
+        let mut update = BatchUpdate::new(0, 1, 0);
+        update.block_hashes.insert(0, hash(0, 0));
+        store.db().batch_update(&update, false).unwrap();
+
+        assert!(!insert_genesis_rune(store.db()).unwrap());
+        assert_eq!(Store::get_runes_count(store.db()).unwrap(), 0);
     }
 }
